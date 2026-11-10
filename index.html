@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#102a59">
+  <meta name="description" content="Goal4win – Pronostics et résultats de football. Consultez trois sélections sportives et leurs archives.">
+  <title>Goal4win – Pronostics & résultats</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="assets/goal4win-icon-192.png" type="image/png">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="#top" aria-label="Goal4win, accueil">
+      <span class="brand-mark">G<span>4</span>W</span>
+      <span class="brand-copy"><strong>Goal4win</strong><small>FOOTBALL • PRONOSTICS • RÉSULTATS</small></span>
+    </a>
+    <a class="header-link" href="#how-it-works">Comment ça marche ?</a>
+  </header>
+
+  <main id="top">
+    <section class="hero">
+      <div class="hero-copy">
+        <p class="eyebrow">LE RENDEZ-VOUS DES PASSIONNÉS</p>
+        <h1>Anticipez les matchs.<br><span>Vivez le football.</span></h1>
+        <p class="hero-description">Retrouvez trois sélections de pronostics, suivez les résultats et explorez les journées passées ou à venir.</p>
+        <a class="hero-cta" href="#selections">Découvrir les sélections <span>↓</span></a>
+      </div>
+      <div class="hero-art" role="img" aria-label="Joueur BASIGEO 237 célébrant une victoire"></div>
+      <div class="hero-glow"></div>
+    </section>
+
+    <section class="date-panel" aria-label="Navigation par date">
+      <div class="date-heading"><div><p class="eyebrow">CALENDRIER</p><h2>Choisissez votre journée</h2></div><button class="today-button" id="todayBtn">Aujourd'hui</button></div>
+      <div class="date-controls">
+        <button class="arrow-button" id="prevBtn" aria-label="Jour précédent">‹</button>
+        <div class="selected-date"><strong id="dateLabel">Chargement…</strong><span id="dateHint">Pronostics et résultats du jour</span></div>
+        <button class="arrow-button" id="nextBtn" aria-label="Jour suivant">›</button>
+      </div>
+      <div class="date-range"><span>10 jours en arrière</span><span class="range-line"><i id="rangeProgress"></i></span><span>2 jours en avant</span></div>
+    </section>
+
+    <section class="selections-section" id="selections">
+      <div class="section-heading"><div><p class="eyebrow">VOS RENDEZ-VOUS FOOTBALL</p><h2>Nos sélections</h2></div><span class="section-note">3 espaces indépendants</span></div>
+      <div class="selection-grid" id="selectionGrid"></div>
+      <p class="demo-note"><span>ⓘ</span> Version de démonstration : les matchs et pronostics affichés sont fictifs et ne constituent pas des conseils de pari.</p>
+    </section>
+
+    <section class="how-section" id="how-it-works">
+      <div class="how-icon">⚽</div><div><p class="eyebrow">SIMPLE ET DIRECT</p><h2>Trois sélections, un seul espace.</h2><p>Choisissez PRONOS 1, 2 ou 3 pour consulter le contenu propre à chaque sélection. Les archives et les prochaines journées se parcourent depuis le calendrier.</p></div>
+    </section>
+
+    <section class="ad-placeholder" aria-label="Emplacement publicitaire réservé"><span class="ad-label">PUBLICITÉ</span><strong>Votre espace publicitaire</strong><small>Emplacement réservé — intégration publicitaire à une prochaine étape.</small></section>
+  </main>
+
+  <footer class="site-footer"><a class="footer-brand" href="#top">Goal<span>4</span>win</a><nav aria-label="Liens légaux"><a href="#privacy" id="privacyLink">Confidentialité</a><a href="#legal" id="legalLink">Mentions légales</a><a href="#terms" id="termsLink">Conditions d'utilisation</a></nav><p>© <span id="year"></span> Goal4win. Tous droits réservés.</p><small>Les pronostics sportifs comportent des risques. Jouez de manière responsable.</small></footer>
+
+  <dialog class="content-dialog" id="contentDialog"><div class="dialog-top"><div><p class="eyebrow" id="dialogEyebrow">SÉLECTION</p><h2 id="dialogTitle">PRONOS 1</h2></div><button class="close-button" id="closeDialog" aria-label="Fermer">×</button></div><p class="dialog-date" id="dialogDate"></p><div id="matchList" class="match-list"></div><p class="dialog-footnote">Données fictives de démonstration. Les vrais pronostics seront administrables dans une prochaine version.</p></dialog>
+  <dialog class="content-dialog small-dialog" id="infoDialog"><div class="dialog-top"><h2 id="infoTitle">Informations</h2><button class="close-button" id="closeInfo" aria-label="Fermer">×</button></div><p id="infoText"></p></dialog>
+
+  <script src="app.js" defer></script>
+</body>
+</html>
