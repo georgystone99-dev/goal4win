@@ -4,9 +4,9 @@ const today = new Date(); today.setHours(0,0,0,0);
 let selectedDate = new Date(today);
 const palettes = ['blue','green','orange'];
 const categories = [
-  {name:'PRONOS 1',tag:'SÉLECTION 01',description:'Une première sélection de rencontres.',matches:[['Lions FC','United Stars','Ligue de démonstration','Victoire domicile','1.55'],['Riverside','Olympique Nord','Coupe de démonstration','Plus de 1,5 buts','1.42']]},
-  {name:'PRONOS 2',tag:'SÉLECTION 02',description:'Une deuxième sélection de rencontres.',matches:[['Atlantic SC','Mountain FC','Championnat de démonstration','Les deux équipes marquent','1.70'],['City Athletic','Royal Blue','Ligue de démonstration','Double chance 1X','1.38']]},
-  {name:'PRONOS 3',tag:'SÉLECTION 03',description:'Une troisième sélection de rencontres.',matches:[['Green Valley','Capital FC','Coupe de démonstration','Moins de 3,5 buts','1.48'],['Sporting East','West Rangers','Championnat de démonstration','Plus de 2,5 buts','1.85']]}
+  {name:'PRONOS 1',tag:'SÉLECTION 01',description:'Une première sélection de rencontres.',matches:[['Lions FC','United Stars','Ligue de démonstration','Victoire domicile','1.55','16:00'],['Riverside','Olympique Nord','Coupe de démonstration','Plus de 1,5 buts','1.42','19:30'],['Harbor City','Eastern Wolves','Ligue de démonstration','Victoire extérieur','1.90','20:00'],['North Rovers','Delta FC','Championnat de démonstration','Match nul ou victoire domicile','1.33','21:00']]},
+  {name:'PRONOS 2',tag:'SÉLECTION 02',description:'Une deuxième sélection de rencontres.',matches:[['Atlantic SC','Mountain FC','Championnat de démonstration','Les deux équipes marquent','1.70','15:00'],['City Athletic','Royal Blue','Ligue de démonstration','Double chance 1X','1.38','18:00'],['Falcons FC','Union Sud','Coupe de démonstration','Plus de 2,5 buts','1.75','20:45']]},
+  {name:'PRONOS 3',tag:'SÉLECTION 03',description:'Une troisième sélection de rencontres.',matches:[['Green Valley','Capital FC','Coupe de démonstration','Moins de 3,5 buts','1.48','14:30'],['Sporting East','West Rangers','Championnat de démonstration','Plus de 2,5 buts','1.85','17:00'],['Red Stars','Blue Harbor','Ligue de démonstration','Victoire domicile','1.60','19:00'],['Oakland FC','Pearl City','Ligue de démonstration','Les deux équipes marquent','1.72','21:00']]}
 ];
 const dateFmt = new Intl.DateTimeFormat('fr-FR',{weekday:'long',day:'numeric',month:'long',year:'numeric'});
 const shortFmt = new Intl.DateTimeFormat('fr-FR',{day:'numeric',month:'short'});
@@ -26,7 +26,7 @@ function renderCards(){
 }
 function openCategory(index){
   const item=categories[index]; $('#dialogEyebrow').textContent=item.tag; $('#dialogTitle').textContent=item.name; $('#dialogDate').textContent=dateFmt.format(selectedDate);
-  $('#matchList').innerHTML=item.matches.map((m,i)=>`<article class="match-card"><div class="match-meta"><span>${m[2]}</span><span>${i===0?'16:00':'19:30'}</span></div><div class="match-teams"><span>${m[0]}</span><span>VS</span><span>${m[1]}</span></div><div class="match-pick"><span>Pronostic de démonstration : <strong>${m[3]}</strong></span><strong>Cote ${m[4]}</strong></div></article>`).join('');
+  $('#matchList').innerHTML=item.matches.map((m,i)=>`<article class="match-card"><div class="match-meta"><span>${m[2]}</span><span>${m[5]}</span></div><div class="match-teams"><span>${m[0]}</span><span>VS</span><span>${m[1]}</span></div><div class="match-pick"><span>Pronostic de démonstration : <strong>${m[3]}</strong></span><strong>Cote ${m[4]}</strong></div></article>`).join('');
   $('#contentDialog').showModal();
 }
 $('#prevBtn').addEventListener('click',()=>{if(dayOffset()>-10){selectedDate=new Date(selectedDate.getTime()-DAY);updateDate()}});
