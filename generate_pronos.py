@@ -50,7 +50,6 @@ SPORTS = {
     "soccer_uefa_champs_league": ("Football", "Ligue des champions"),
     "soccer_uefa_europa_league": ("Football", "Ligue Europa"),
     "basketball_nba": ("Basketball", "NBA"),
-    "basketball_spain_acb": ("Basketball", "Liga ACB"),
     "basketball_euroleague": ("Basketball", "EuroLeague"),
 }
 DEFAULT_SPREADSHEET_ID = "11t2NRQYociuLCvE-VzicXg282XxTXDctM7oychcH5cQ"
