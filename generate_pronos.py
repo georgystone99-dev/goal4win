@@ -56,9 +56,23 @@ SPORTS = {
     "soccer_belgium_first_div": ("Football", "First Division A"),
     "soccer_turkey_super_league": ("Football", "Süper Lig"),
     "soccer_efl_champ": ("Football", "Championship"),
+    "soccer_spl": ("Football", "Scottish Premiership"),
+    "soccer_switzerland_superleague": ("Football", "Swiss Super League"),
+    "soccer_austria_bundesliga": ("Football", "Austrian Bundesliga"),
+    "soccer_greece_super_league": ("Football", "Super League"),
+    "soccer_norway_eliteserien": ("Football", "Eliteserien"),
+    "soccer_sweden_allsvenskan": ("Football", "Allsvenskan"),
+    "soccer_denmark_superliga": ("Football", "Superliga"),
+    "soccer_poland_ekstraklasa": ("Football", "Ekstraklasa"),
+    "soccer_uefa_europa_conference_league": ("Football", "Ligue Conférence"),
+    "soccer_uefa_nations_league": ("Football", "Ligue des Nations"),
+    "soccer_fifa_world_cup_qualifiers_europe": ("Football", "Qualifications Coupe du Monde"),
+    "soccer_uefa_european_championship": ("Football", "Euro"),
+    "soccer_fifa_world_cup": ("Football", "Coupe du Monde"),
     "basketball_nba": ("Basketball", "NBA"),
     "basketball_euroleague": ("Basketball", "EuroLeague"),
 }
+SPORT_PRIORITY = tuple(SPORTS)
 SPORT_BY_COMPETITION = {
     competition.casefold(): sport_key
     for sport_key, (_, competition) in SPORTS.items()
@@ -135,48 +149,190 @@ def api_get(path: str, params: dict[str, str], api_key: str) -> tuple[Any, dict[
     return payload, headers
 
 
-def fetch_events(
-    api_key: str, start: datetime, end: datetime
-) -> tuple[list[dict[str, Any]], list[str], int]:
-    """Use the free events endpoint first, so inactive leagues cost no odds credits."""
-    events: list[dict[str, Any]] = []
+def active_sports(api_key: str) -> dict[str, tuple[str, str]]:
+    """Discover active soccer leagues and the supported basketball competitions for free."""
+    payload, _ = api_get("/sports", {}, api_key)
+    if not isinstance(payload, list):
+        raise RuntimeError("Réponse inattendue de l’API pour /sports.")
+
+    discovered: dict[str, tuple[str, str]] = {}
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key", ""))
+        group = normalized(item.get("group", ""))
+        if key.startswith("soccer_") or "soccer" in group or "football" in group:
+            sport = ("Football", str(item.get("title") or key))
+        elif key in {"basketball_nba", "basketball_euroleague"}:
+            sport = ("Basketball", str(item.get("title") or key))
+        else:
+            continue
+        SPORT_BY_COMPETITION[sport[1].casefold()] = key
+        if item.get("active") is True:
+            discovered[key] = sport
+
+    known_football = [
+        key
+        for key in SPORT_PRIORITY
+        if key in discovered and discovered[key][0] == "Football"
+    ]
+    other_football = sorted(
+        key
+        for key, (sport, _) in discovered.items()
+        if sport == "Football" and key not in known_football
+    )
+    known_basketball = [
+        key
+        for key in SPORT_PRIORITY
+        if key in discovered and discovered[key][0] == "Basketball"
+    ]
+    ordered_keys = known_football + other_football + known_basketball
+    ordered = {key: discovered[key] for key in ordered_keys}
+    return ordered
+
+
+def date_window(match_date: date, now: datetime) -> tuple[datetime, datetime]:
+    local_start = datetime.combine(match_date, time.min, tzinfo=TIMEZONE)
+    local_end = datetime.combine(match_date + timedelta(days=1), time.min, tzinfo=TIMEZONE)
+    start = max(now, local_start.astimezone(timezone.utc))
+    end = local_end.astimezone(timezone.utc) - timedelta(seconds=1)
+    return start, end
+
+
+def sheet_date_counts(rows: list[list[str]]) -> dict[str, dict[str, list[list[str]]]]:
+    if not rows:
+        return {}
+    indexes = {normalized(name): index for index, name in enumerate(rows[0])}
+    date_index = indexes.get("date", -1)
+    panel_index = indexes.get("type de case", -1)
+    if date_index < 0 or panel_index < 0:
+        raise RuntimeError("Colonnes Date et Type de Case introuvables dans Google Sheets.")
+
+    grouped: dict[str, dict[str, list[list[str]]]] = {}
+    for row in rows[1:]:
+        if date_index >= len(row) or panel_index >= len(row):
+            continue
+        match_date = _sheet_date(row[date_index])
+        if match_date is not None:
+            grouped.setdefault(match_date.isoformat(), {}).setdefault(
+                row[panel_index].strip(), []
+            ).append(row)
+    return grouped
+
+
+def date_is_complete(panel_rows: dict[str, list[list[str]]]) -> bool:
+    if set(panel_rows) != {"1", "2", "3"}:
+        return False
+    matches = [
+        fixture_key_from_match(row[5].strip())
+        for rows in panel_rows.values()
+        for row in rows
+        if len(row) > 5 and row[5].strip()
+    ]
+    return (
+        all(len(panel_rows[number]) == 4 for number in ("1", "2", "3"))
+        and len(matches) == 12
+        and len({normalized(match) for match in matches}) == 12
+    )
+
+
+def fetch_daily_panels(
+    api_key: str,
+    target_dates: list[date],
+    now: datetime,
+    sports: dict[str, tuple[str, str]],
+    existing_rows: list[list[str]],
+) -> tuple[dict[date, list[Panel]], list[str], int]:
+    grouped = sheet_date_counts(existing_rows)
+    panels_by_date: dict[date, list[Panel]] = {}
     remaining: list[str] = []
     odds_requests = 0
-    for sport_key in SPORTS:
-        params = {
-            "dateFormat": "iso",
-            "commenceTimeFrom": iso_utc(start),
-            "commenceTimeTo": iso_utc(end),
-        }
-        payload, _ = api_get(f"/sports/{sport_key}/events", params, api_key)
-        if not isinstance(payload, list):
-            raise RuntimeError(f"Réponse inattendue de l’API pour {sport_key}/events.")
-        if not payload:
-            print(f"{sport_key}: aucun match dans la fenêtre.")
+
+    for match_date in target_dates:
+        existing_for_date = grouped.get(match_date.isoformat(), {})
+        if date_is_complete(existing_for_date):
             continue
 
-        odds_params = {
-            **params,
-            "regions": "eu",
-            "markets": ",".join(MARKETS),
-            "oddsFormat": "decimal",
-            "dateFormat": "iso",
-        }
-        odds_payload, headers = api_get(
-            f"/sports/{sport_key}/odds", odds_params, api_key
-        )
-        odds_requests += 1
-        if not isinstance(odds_payload, list):
-            raise RuntimeError(f"Réponse inattendue de l’API pour {sport_key}/odds.")
-        if headers.get("x-requests-remaining") is not None:
-            remaining.append(headers["x-requests-remaining"])
-        events.extend(
-            event
-            for event in odds_payload
-            if is_in_window(event.get("commence_time"), start, end)
-        )
-        print(f"{sport_key}: {len(odds_payload)} match(s) avec cotes récupérés.")
-    return events, remaining, odds_requests
+        start, end = date_window(match_date, now)
+        if end < start:
+            continue
+        day_events: list[dict[str, Any]] = []
+        selections: list[Selection] = []
+        for sport_key in sports:
+            params = {
+                "dateFormat": "iso",
+                "commenceTimeFrom": iso_utc(start),
+                "commenceTimeTo": iso_utc(end),
+            }
+            event_payload, _ = api_get(
+                f"/sports/{sport_key}/events", params, api_key
+            )
+            if not isinstance(event_payload, list):
+                raise RuntimeError(
+                    f"Réponse inattendue de l’API pour {sport_key}/events."
+                )
+            if not event_payload:
+                continue
+
+            odds_params = {
+                **params,
+                "regions": "eu",
+                "markets": ",".join(MARKETS),
+                "oddsFormat": "decimal",
+            }
+            odds_payload, headers = api_get(
+                f"/sports/{sport_key}/odds", odds_params, api_key
+            )
+            odds_requests += 1
+            if not isinstance(odds_payload, list):
+                raise RuntimeError(
+                    f"Réponse inattendue de l’API pour {sport_key}/odds."
+                )
+            if headers.get("x-requests-remaining") is not None:
+                remaining.append(headers["x-requests-remaining"])
+            day_events.extend(
+                event
+                for event in odds_payload
+                if isinstance(event, dict)
+                and is_in_window(event.get("commence_time"), start, end)
+            )
+            selections = selections_from_events(day_events, sports)
+            day_selections = [
+                selection
+                for selection in selections
+                if selection.commence_time.astimezone(TIMEZONE).date() == match_date
+            ]
+            panels = build_daily_panels(day_selections, existing_for_date)
+            print(
+                f"{match_date.isoformat()} / {sport_key}: "
+                f"{len(day_selections)} sélection(s) admissible(s)."
+            )
+            if all(
+                len(existing_for_date.get(str(panel.number), []))
+                + len(panel.selections)
+                == 4
+                for panel in panels
+            ):
+                break
+
+        day_selections = [
+            selection
+            for selection in selections
+            if selection.commence_time.astimezone(TIMEZONE).date() == match_date
+        ]
+        panels = build_daily_panels(day_selections, existing_for_date)
+        if not all(
+            len(existing_for_date.get(str(panel.number), []))
+            + len(panel.selections)
+            == 4
+            for panel in panels
+        ):
+            raise RuntimeError(
+                f"12 matchs uniques (4 par panneau) ne sont pas disponibles "
+                f"pour le {match_date.isoformat()} ; Google Sheets n’a pas été modifié."
+            )
+        panels_by_date[match_date] = panels
+    return panels_by_date, remaining, odds_requests
 
 
 def is_in_window(value: Any, start: datetime, end: datetime) -> bool:
@@ -202,6 +358,17 @@ def outcome_key(name: str, home: str, away: str) -> str | None:
     if normalized == "under":
         return "under"
     return None
+
+
+def fixture_key(home: str, away: str) -> str:
+    return "|".join(sorted((normalized(home), normalized(away))))
+
+
+def fixture_key_from_match(value: str) -> str:
+    teams = value.split(" - ", 1)
+    if len(teams) != 2:
+        return normalized(value)
+    return fixture_key(teams[0], teams[1])
 
 
 def market_groups(event: dict[str, Any]) -> dict[tuple[str, float | None], dict[str, dict[str, float]]]:
@@ -237,12 +404,16 @@ def market_groups(event: dict[str, Any]) -> dict[tuple[str, float | None], dict[
     return groups
 
 
-def quote_candidates(event: dict[str, Any], sport_key: str) -> list[Selection]:
+def quote_candidates(
+    event: dict[str, Any],
+    sport_key: str,
+    sports: dict[str, tuple[str, str]] | None = None,
+) -> list[Selection]:
     try:
         commence_time = parse_datetime(str(event["commence_time"]))
     except (KeyError, ValueError) as exc:
         raise ValueError(f"Match sans heure de début valide : {event!r}") from exc
-    sport, competition = SPORTS[sport_key]
+    sport, competition = (sports or SPORTS)[sport_key]
     home = str(event.get("home_team", ""))
     away = str(event.get("away_team", ""))
     expected_h2h = {"home", "away", "draw"} if sport == "Football" else {"home", "away"}
@@ -298,13 +469,17 @@ def format_line(value: float) -> str:
     return f"{value:g}".replace(".", ",")
 
 
-def selections_from_events(events: list[dict[str, Any]]) -> list[Selection]:
+def selections_from_events(
+    events: list[dict[str, Any]],
+    sports: dict[str, tuple[str, str]] | None = None,
+) -> list[Selection]:
+    available_sports = sports or SPORTS
     best_by_event: dict[str, Selection] = {}
     for event in events:
         sport_key = str(event.get("sport_key", ""))
-        if sport_key not in SPORTS:
+        if sport_key not in available_sports:
             continue
-        eligible = quote_candidates(event, sport_key)
+        eligible = quote_candidates(event, sport_key, available_sports)
         if not eligible:
             continue
         best = max(
@@ -321,8 +496,15 @@ def selections_from_events(events: list[dict[str, Any]]) -> list[Selection]:
         previous = best_by_event.get(best.event_id)
         if previous is None or best.probability > previous.probability:
             best_by_event[best.event_id] = best
+    best_by_fixture: dict[tuple[str, str], Selection] = {}
+    for selection in best_by_event.values():
+        local_date = selection.commence_time.astimezone(TIMEZONE).date().isoformat()
+        key = (local_date, fixture_key(selection.home, selection.away))
+        previous = best_by_fixture.get(key)
+        if previous is None or selection.probability > previous.probability:
+            best_by_fixture[key] = selection
     return sorted(
-        best_by_event.values(),
+        best_by_fixture.values(),
         key=lambda selection: (-selection.probability, selection.commence_time),
     )
 
@@ -359,19 +541,26 @@ def build_panels(selections: list[Selection]) -> list[Panel]:
         for item in selections
         if item.sport == "Basketball"
         and item.probability > MIN_BASKETBALL_PROBABILITY
+        and item.odds <= 1.32
         and item.strong_consensus
     ]
     used_events: set[str] = set()
+    used_matches: set[str] = set()
 
     for selection in football:
+        match = fixture_key(selection.home, selection.away)
+        if match in used_matches:
+            continue
         panel = choose_panel(panels, max_football=3)
         if panel is None:
             break
         panel.selections.append(selection)
         used_events.add(selection.event_id)
+        used_matches.add(match)
 
     for selection in basketball:
-        if selection.event_id in used_events:
+        match = fixture_key(selection.home, selection.away)
+        if selection.event_id in used_events or match in used_matches:
             continue
         available = [
             panel
@@ -387,11 +576,15 @@ def build_panels(selections: list[Selection]) -> list[Panel]:
         )
         panel.selections.append(selection)
         used_events.add(selection.event_id)
+        used_matches.add(match)
 
     extra_football = [
         item for item in football if item.event_id not in used_events
     ]
     for selection in extra_football:
+        match = fixture_key(selection.home, selection.away)
+        if match in used_matches:
+            continue
         available = [
             panel
             for panel in panels
@@ -406,6 +599,112 @@ def build_panels(selections: list[Selection]) -> list[Panel]:
         )
         panel.selections.append(selection)
         used_events.add(selection.event_id)
+        used_matches.add(match)
+
+    for panel in panels:
+        panel.selections.sort(
+            key=lambda selection: (-selection.probability, selection.commence_time)
+        )
+    return panels
+
+
+def build_daily_panels(
+    selections: list[Selection],
+    existing_panels: dict[str, list[list[str]]],
+) -> list[Panel]:
+    """Assign only new picks to the remaining slots without replacing sheet rows."""
+    panels = [Panel(number=index, selections=[]) for index in (1, 2, 3)]
+    football_counts = {number: 0 for number in (1, 2, 3)}
+    basketball_counts = {number: 0 for number in (1, 2, 3)}
+    occupied_counts = {number: 0 for number in (1, 2, 3)}
+    existing_matches: set[str] = set()
+
+    for panel in panels:
+        rows = existing_panels.get(str(panel.number), [])
+        if len(rows) > 4:
+            raise RuntimeError(
+                f"Le panneau {panel.number} contient déjà plus de 4 matchs."
+            )
+        for row in rows:
+            discipline = normalized(row[3] if len(row) > 3 else "")
+            if discipline == normalized("Basketball"):
+                basketball_counts[panel.number] += 1
+            elif discipline == normalized("Football"):
+                football_counts[panel.number] += 1
+            else:
+                raise RuntimeError(
+                    f"Discipline invalide dans le panneau {panel.number}."
+                )
+            occupied_counts[panel.number] += 1
+            if len(row) > 5:
+                existing_matches.add(fixture_key_from_match(row[5]))
+
+    if any(
+        football_counts[number] > 3 or basketball_counts[number] > 1
+        for number in (1, 2, 3)
+    ):
+        raise RuntimeError("La composition d’un panneau existant ne peut pas être complétée.")
+
+    used_events: set[str] = set()
+    used_matches = set(existing_matches)
+    candidates = [
+        selection
+        for selection in selections
+        if fixture_key(selection.home, selection.away) not in existing_matches
+    ]
+    football = [item for item in candidates if item.sport == "Football"]
+    basketball = [
+        item
+        for item in candidates
+        if item.sport == "Basketball"
+        and item.probability > MIN_BASKETBALL_PROBABILITY
+        and item.odds <= 1.32
+        and item.strong_consensus
+    ]
+
+    def add_next(panel_number: int, choices: list[Selection]) -> bool:
+        panel = panels[panel_number - 1]
+        for selection in choices:
+            match = fixture_key(selection.home, selection.away)
+            if selection.event_id in used_events or match in used_matches:
+                continue
+            panel.selections.append(selection)
+            used_events.add(selection.event_id)
+            used_matches.add(match)
+            occupied_counts[panel_number] += 1
+            if selection.sport == "Football":
+                football_counts[panel_number] += 1
+            else:
+                basketball_counts[panel_number] += 1
+            return True
+        return False
+
+    for panel in panels:
+        number = panel.number
+        while (
+            football_counts[number] < 3
+            and occupied_counts[number] < 4
+            and add_next(number, football)
+        ):
+            pass
+
+    for panel in panels:
+        number = panel.number
+        if (
+            football_counts[number] == 3
+            and basketball_counts[number] == 0
+            and occupied_counts[number] < 4
+        ):
+            add_next(number, basketball)
+
+    for panel in panels:
+        number = panel.number
+        while (
+            football_counts[number] < (3 if basketball_counts[number] else 4)
+            and occupied_counts[number] < 4
+            and add_next(number, football)
+        ):
+            pass
 
     for panel in panels:
         panel.selections.sort(
@@ -475,9 +774,10 @@ def normalized(value: Any) -> str:
 
 
 def match_key(row: list[str], indexes: dict[str, int]) -> tuple[str, str]:
+    match = row[indexes["Match"]] if indexes["Match"] < len(row) else ""
     return (
         row[indexes["Date"]] if indexes["Date"] < len(row) else "",
-        normalized(row[indexes["Match"]] if indexes["Match"] < len(row) else ""),
+        fixture_key_from_match(match),
     )
 
 
@@ -516,7 +816,7 @@ def merge_sheet_rows(
     panel_rows: dict[tuple[str, str], list[list[str]]] = {}
     locked_panels: set[tuple[str, str]] = set()
     today = now.astimezone(TIMEZONE).date()
-    last_generation_date = today + timedelta(days=1)
+    last_generation_date = today + timedelta(days=2)
 
     for row in kept_rows:
         panel_key = (row[indexes["Date"]], row[indexes["Type de Case"]])
@@ -533,16 +833,26 @@ def merge_sheet_rows(
             ):
                 locked_panels.add(panel_key)
 
+    complete_dates = {
+        match_date
+        for match_date, panels in sheet_date_counts([header, *kept_rows]).items()
+        if date_is_complete(panels)
+    }
     new_indexes = {normalized(name): index for index, name in enumerate(new_rows[0])}
-    planned_count = sum(len(rows) for rows in panel_rows.values())
+    date_counts: dict[str, int] = {}
+    for row in kept_rows:
+        date_counts[row[indexes["Date"]]] = date_counts.get(row[indexes["Date"]], 0) + 1
     added_rows = 0
     for raw_row in new_rows[1:]:
         row = normalize_row_from(raw_row, new_indexes)
-        row_date = _sheet_date(row[indexes["Date"]])
+        date_value = row[indexes["Date"]]
+        row_date = _sheet_date(date_value)
         if row_date is None or not today <= row_date <= last_generation_date:
             continue
+        if date_value in complete_dates or date_counts.get(date_value, 0) >= 12:
+            continue
         key = match_key(row, indexes)
-        if not key[1] or key in existing_keys or planned_count >= 12:
+        if not key[1] or key in existing_keys:
             continue
         panel_key = (row[indexes["Date"]], row[indexes["Type de Case"]])
         current_panel_rows = panel_rows.get(panel_key, [])
@@ -551,7 +861,7 @@ def merge_sheet_rows(
         kept_rows.append(row)
         panel_rows.setdefault(panel_key, []).append(row)
         existing_keys.add(key)
-        planned_count += 1
+        date_counts[date_value] = date_counts.get(date_value, 0) + 1
         added_rows += 1
 
     print(f"Google Sheets : {added_rows} nouveau(x) match(s) ajouté(s), historique conservé.")
@@ -631,10 +941,27 @@ def open_google_worksheet():
         raise RuntimeError(f"Accès à Google Sheets impossible : {exc}") from exc
 
 
-def write_google_sheet(rows: list[list[str]], now: datetime | None = None) -> None:
-    worksheet = open_google_worksheet()
+def write_google_sheet(
+    rows: list[list[str]],
+    now: datetime | None = None,
+    worksheet: Any | None = None,
+    required_dates: list[date] | None = None,
+) -> None:
+    worksheet = worksheet or open_google_worksheet()
     old_values = worksheet.get_all_values()
     merged_rows = merge_sheet_rows(old_values, rows, now or datetime.now(timezone.utc))
+    if required_dates:
+        grouped = sheet_date_counts(merged_rows)
+        incomplete = [
+            match_date.isoformat()
+            for match_date in required_dates
+            if not date_is_complete(grouped.get(match_date.isoformat(), {}))
+        ]
+        if incomplete:
+            raise RuntimeError(
+                "Les dates suivantes ne peuvent pas être complétées sans modifier "
+                "des matchs déjà verrouillés : " + ", ".join(incomplete)
+            )
     old_count = len(old_values)
     row_count = len(merged_rows)
     padded_rows = [
@@ -730,6 +1057,13 @@ def update_sheet_results(api_key: str) -> int:
     def cell(row: list[str], name: str) -> str:
         index = indexes[name]
         return row[index].strip() if index >= 0 and index < len(row) else ""
+
+    if any(
+        cell(row, "Compétition")
+        and cell(row, "Compétition").casefold() not in SPORT_BY_COMPETITION
+        for row in values[1:]
+    ):
+        active_sports(api_key)
 
     eligible_sports: set[str] = set()
     for row in values[1:]:
@@ -845,21 +1179,32 @@ def main() -> int:
         google_credentials_ready()
 
     now = datetime.now(timezone.utc)
-    start = now
-    local_now = now.astimezone(TIMEZONE)
-    end_of_tomorrow = datetime.combine(
-        local_now.date() + timedelta(days=2), time.min, tzinfo=TIMEZONE
-    ).astimezone(timezone.utc) - timedelta(seconds=1)
-    end = min(now + timedelta(hours=48), end_of_tomorrow)
-    events, remaining, odds_requests = fetch_events(api_key, start, end)
-    selections = selections_from_events(events)
-    panels = build_panels(selections)
+    today = now.astimezone(TIMEZONE).date()
+    target_dates = [today + timedelta(days=offset) for offset in range(3)]
+    worksheet = None
+    existing_rows: list[list[str]] = []
+    if not args.dry_run:
+        worksheet = open_google_worksheet()
+        existing_rows = worksheet.get_all_values()
 
-    print(
-        f"\n{len(events)} match(s) reçus dans la fenêtre "
-        f"{start.astimezone(TIMEZONE):%Y-%m-%d %H:%M}–"
-        f"{end.astimezone(TIMEZONE):%Y-%m-%d %H:%M} (heure du Cameroun)."
-    )
+    existing_by_date = sheet_date_counts(existing_rows)
+    missing_dates = [
+        match_date
+        for match_date in target_dates
+        if not date_is_complete(existing_by_date.get(match_date.isoformat(), {}))
+    ]
+    panels_by_date: dict[date, list[Panel]] = {}
+    remaining: list[str] = []
+    odds_requests = 0
+    if missing_dates:
+        sports = active_sports(api_key)
+        panels_by_date, remaining, odds_requests = fetch_daily_panels(
+            api_key, missing_dates, now, sports, existing_rows
+        )
+
+    for match_date, panels in panels_by_date.items():
+        print(f"\nPronostics du {match_date.isoformat()} (heure du Cameroun) :")
+        display_panels(panels)
     print(
         f"Crédits Odds API estimés pour les cotes : "
         f"{odds_requests * len(MARKETS)} "
@@ -867,18 +1212,15 @@ def main() -> int:
     )
     if remaining:
         print(f"Crédits restants selon l’API : {remaining[-1]}.")
-    display_panels(panels)
     if args.dry_run:
         print("\nMode dry-run : Google Sheets n’a pas été modifié.")
+    elif missing_dates:
+        rows = [list(SHEET_HEADERS)]
+        for panels in panels_by_date.values():
+            rows.extend(panels_to_sheet_rows(panels)[1:])
+        write_google_sheet(rows, now, worksheet, missing_dates)
     else:
-        if sum(len(panel.selections) for panel in panels) != 12 or any(
-            len(panel.selections) != 4 for panel in panels
-        ):
-            raise RuntimeError(
-                "12 sélections uniques (4 par panneau) ne sont pas disponibles ; "
-                "Google Sheets n’a pas été modifié."
-            )
-        write_google_sheet(panels_to_sheet_rows(panels), now)
+        print("\nLes dates J, J+1 et J+2 sont déjà complètes ; aucune modification.")
     return 0
 
 

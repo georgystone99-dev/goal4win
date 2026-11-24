@@ -30,7 +30,7 @@ Puis ouvrez `http://localhost:8000`.
 
 ## Générer les pronostics
 
-Le script `generate_pronos.py` récupère les cotes `h2h` et `totals` de The Odds API pour les matchs à venir aujourd'hui et demain, dans la limite de 48 heures. Il couvre les principaux championnats européens, l'NBA et l'EuroLeague, calcule les probabilités corrigées de la marge, filtre les cotes entre 1,20 et 1,50 inclus et répartit 12 matchs uniques (4 par panneau). Un pari basketball n'est retenu que si sa probabilité corrigée dépasse 75 % et que les bookmakers sont suffisamment convergents.
+Le script `generate_pronos.py` génère séparément les pronostics d'aujourd'hui (J), demain (J+1) et après-demain (J+2). Il vérifie d'abord l'onglet `Matchs` et ne demande pas de nouvelles cotes pour une date qui contient déjà 12 matchs uniques (4 par panneau). Pour chaque date manquante ou incomplète, il cherche 12 matchs uniques et fiables, répartis en 3 panneaux de 4. Les cotes sont comprises entre 1,20 et 1,50 inclus ; un panneau peut inclure 3 matchs de football et 1 de basketball uniquement si la probabilité corrigée du match de basketball dépasse 75 % et sa cote est au plus 1,32. Les compétitions actives sont découvertes par l'endpoint gratuit `/v4/sports`, puis interrogées par priorité ; les demandes payantes cessent dès que la journée a ses 12 pronostics. Les lignes de J−10 à J+2 sont conservées et seules celles antérieures à J−10 sont purgées.
 
 1. Installez les dépendances : `python -m pip install -r requirements.txt`.
 2. Définissez `ODDS_API_KEY` avec votre clé The Odds API.
@@ -40,7 +40,7 @@ Le script `generate_pronos.py` récupère les cotes `h2h` et `totals` de The Odd
 
 Le script utilise par défaut la feuille déjà lue par la PWA et son premier onglet. `GOOGLE_SHEET_ID` et `GOOGLE_SHEET_NAME` permettent de changer de feuille ou d’onglet. Les identifiants Google ne doivent jamais être publiés. Les matchs retenus sont datés selon le fuseau `Africa/Douala` et écrits avec les colonnes attendues par `app.js`. Les lignes des 10 derniers jours sont conservées ; les seules lignes purgées sont celles plus anciennes que J−10. Les rencontres futures déjà présentes ne sont pas dupliquées et les panneaux verrouillés/en cours ne sont pas modifiés.
 
-Le workflow GitHub Actions met à jour les résultats chaque jour à 00h00 UTC, puis actualise les résultats et génère les nouveaux pronostics à 06h30 UTC. Les appels au point de terminaison des événements servent d’abord à ignorer les championnats sans match dans la fenêtre et ne consomment pas de crédits de cotes. La récupération des cotes ne demande qu’une région (`eu`) et deux marchés. Le quota restant renvoyé par l’API est affiché lorsqu’il est disponible ; surveillez-le avant d’automatiser des exécutions fréquentes.
+Le workflow GitHub Actions met à jour les résultats chaque jour à 00h00 UTC, puis actualise les résultats et génère les nouveaux pronostics à 06h30 UTC. Les appels au point de terminaison des événements servent d'abord à ignorer les championnats sans match dans la journée et ne consomment pas de crédits de cotes. La récupération des cotes ne demande qu'une région (`eu`) et deux marchés. Le quota restant renvoyé par l'API est affiché lorsqu'il est disponible ; surveillez-le avant d'automatiser des exécutions fréquentes.
 
 ## Important avant une mise en production
 

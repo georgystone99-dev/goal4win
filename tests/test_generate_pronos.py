@@ -1,12 +1,17 @@
 import unittest
+from dataclasses import replace
 from datetime import datetime, timezone
 from unittest.mock import patch
 
 from generate_pronos import (
     Panel,
     Selection,
+    active_sports,
     build_panels,
+    build_daily_panels,
+    date_is_complete,
     evaluate_pick,
+    fetch_daily_panels,
     merge_sheet_rows,
     panels_to_sheet_rows,
     quote_candidates,
@@ -158,7 +163,8 @@ class PanelTests(unittest.TestCase):
         football = [selection(f"f-{i}", probability=0.8 - i * 0.01) for i in range(12)]
         basketball = [
             selection("b-weak", sport="Basketball", probability=0.70, odds=1.40),
-            selection("b-strong", sport="Basketball", probability=0.76, odds=1.40),
+            selection("b-expensive", sport="Basketball", probability=0.80, odds=1.40),
+            selection("b-strong", sport="Basketball", probability=0.76, odds=1.30),
         ]
         panels = build_panels(football + basketball)
 
@@ -166,6 +172,7 @@ class PanelTests(unittest.TestCase):
         self.assertEqual(len(all_selections), 12)
         self.assertEqual(len({item.event_id for item in all_selections}), 12)
         self.assertNotIn("b-weak", {item.event_id for item in all_selections})
+        self.assertNotIn("b-expensive", {item.event_id for item in all_selections})
         self.assertIn("b-strong", {item.event_id for item in all_selections})
         self.assertTrue(all(len(panel.selections) == 4 for panel in panels))
 
@@ -179,6 +186,89 @@ class PanelTests(unittest.TestCase):
         self.assertTrue(
             all(sum(item.sport == "Football" for item in panel.selections) == 4 for panel in panels)
         )
+
+    def test_active_sports_discovers_active_soccer_and_supported_basketball(self):
+        response = [
+            {"key": "soccer_new_league", "group": "Soccer", "title": "New League", "active": True},
+            {"key": "soccer_epl", "group": "Soccer", "title": "Premier League", "active": True},
+            {"key": "soccer_inactive", "group": "Soccer", "title": "Inactive", "active": False},
+            {"key": "basketball_nba", "group": "Basketball", "title": "NBA", "active": True},
+            {"key": "basketball_other", "group": "Basketball", "title": "Other", "active": True},
+        ]
+        with patch("generate_pronos.api_get", return_value=(response, {})) as api_get:
+            sports = active_sports("test-key")
+
+        self.assertEqual(list(sports), ["soccer_epl", "soccer_new_league", "basketball_nba"])
+        self.assertEqual(sports["soccer_new_league"], ("Football", "New League"))
+        api_get.assert_called_once_with("/sports", {}, "test-key")
+
+    def test_sheet_date_requires_three_complete_unique_panels(self):
+        panel_rows = {
+            "1": [["2026-11-24", "1", "", "", "", f"Home {i} - Away {i}"] for i in range(4)],
+            "2": [["2026-11-24", "2", "", "", "", f"Home {i + 4} - Away {i + 4}"] for i in range(4)],
+            "3": [["2026-11-24", "3", "", "", "", f"Home {i + 8} - Away {i + 8}"] for i in range(4)],
+        }
+
+        self.assertTrue(date_is_complete(panel_rows))
+        panel_rows["3"].pop()
+        self.assertFalse(date_is_complete(panel_rows))
+
+    def test_daily_panels_fill_only_missing_slots_for_incomplete_dates(self):
+        existing = {
+            "1": [["2026-11-24", "1", "À venir", "Football", "Test",
+                   "Home existing - Away existing"]],
+            "2": [],
+            "3": [],
+        }
+        candidates = [
+            selection("existing", probability=0.9),
+            *[selection(f"new-{index}", probability=0.8 - index * 0.01) for index in range(12)],
+        ]
+        candidates[0] = replace(
+            candidates[0], home="Home existing", away="Away existing"
+        )
+
+        panels = build_daily_panels(candidates, existing)
+
+        self.assertEqual([len(panel.selections) for panel in panels], [3, 4, 4])
+        self.assertNotIn(
+            "existing",
+            {item.event_id for panel in panels for item in panel.selections},
+        )
+
+    def test_daily_fetch_stops_after_twelve_picks_for_date(self):
+        match_date = datetime(2026, 11, 24, 12, tzinfo=timezone.utc).date()
+        events = []
+        for index in range(12):
+            event = event_fixture()
+            event["id"] = f"event-{index}"
+            event["home_team"] = f"Home {index}"
+            event["away_team"] = f"Away {index}"
+            event["commence_time"] = f"2026-11-24T{12 + index % 8:02}:00:00Z"
+            for bookmaker in event["bookmakers"]:
+                for outcome in bookmaker["markets"][0]["outcomes"]:
+                    if outcome["name"] == "Home FC":
+                        outcome["name"] = event["home_team"]
+                    elif outcome["name"] == "Away FC":
+                        outcome["name"] = event["away_team"]
+            events.append(event)
+
+        def fake_api_get(path, params, api_key):
+            return (events, {}) if path.endswith("/events") else (events, {"x-requests-remaining": "499"})
+
+        with patch("generate_pronos.api_get", side_effect=fake_api_get) as api_get:
+            panels_by_date, remaining, request_count = fetch_daily_panels(
+                "test-key",
+                [match_date],
+                datetime(2026, 11, 24, 8, tzinfo=timezone.utc),
+                {"soccer_epl": ("Football", "Premier League")},
+                [],
+            )
+
+        self.assertTrue(all(len(panel.selections) == 4 for panel in panels_by_date[match_date]))
+        self.assertEqual(request_count, 1)
+        self.assertEqual(remaining, ["499"])
+        self.assertEqual(api_get.call_count, 2)
 
     def test_sheet_merge_keeps_recent_history_and_locked_matches(self):
         now = datetime(2026, 11, 24, 8, tzinfo=timezone.utc)
@@ -207,6 +297,39 @@ class PanelTests(unittest.TestCase):
         self.assertEqual(len(merged), 3)
         self.assertEqual(merged[1][5], "Locked - Match")
         self.assertEqual(merged[2][5], "New - Match")
+
+    def test_sheet_merge_preserves_full_days_and_accepts_after_tomorrow(self):
+        now = datetime(2026, 11, 24, 8, tzinfo=timezone.utc)
+        header = [
+            "Date", "Type de Case", "Statut global", "Discipline",
+            "Compétition", "Match", "Prono", "Cote", "Heure",
+            "Cote totale", "Résultat", "Score",
+        ]
+        existing = [header]
+        for panel in ("1", "2", "3"):
+            for index in range(4):
+                number = (int(panel) - 1) * 4 + index
+                existing.append(
+                    [
+                        "2026-11-24", panel, "À venir", "Football", "Premier League",
+                        f"Home {number} - Away {number}", "Vainqueur 1", "1,30",
+                        "18:00", "1,30", "", "",
+                    ]
+                )
+        generated = [
+            header,
+            ["2026-11-24", "1", "À venir", "Football", "Premier League",
+             "Replacement - Match", "Vainqueur 1", "1,30", "19:00", "1,30", "", ""],
+            ["2026-11-26", "1", "À venir", "Football", "Premier League",
+             "New Day - Match", "Vainqueur 1", "1,30", "19:00", "1,30", "", ""],
+            ["2026-11-27", "1", "À venir", "Football", "Premier League",
+             "Outside Window - Match", "Vainqueur 1", "1,30", "19:00", "1,30", "", ""],
+        ]
+
+        merged = merge_sheet_rows(existing, generated, now)
+
+        self.assertEqual(len(merged), 14)
+        self.assertEqual(merged[1:], existing[1:] + [generated[2]])
 
     def test_sheet_rows_match_pwa_columns_and_time_format(self):
         panels = [Panel(number=1, selections=[selection("f-1")]),
