@@ -31,7 +31,6 @@ MAX_ODDS = 1.50
 MIN_BOOKMAKERS = 3
 MIN_BASKETBALL_PROBABILITY = 0.75
 MAX_CONSENSUS_SPREAD = 0.06
-SUPPORTED_BASKETBALL = {"basketball_nba", "basketball_euroleague"}
 SHEET_HEADERS = (
     "Date",
     "Type de Case",
@@ -86,7 +85,25 @@ SPORTS = {
     "basketball_nba": ("Basketball", "NBA"),
     "basketball_euroleague": ("Basketball", "EuroLeague"),
 }
-SPORT_PRIORITY = tuple(SPORTS)
+ODDS_COMPETITION_PRIORITY = (
+    "soccer_epl",
+    "soccer_spain_la_liga",
+    "soccer_germany_bundesliga",
+    "soccer_italy_serie_a",
+    "soccer_france_ligue_one",
+    "soccer_portugal_primeira_liga",
+    "soccer_netherlands_eredivisie",
+    "soccer_belgium_first_div",
+    "soccer_turkey_super_league",
+    "soccer_uefa_champs_league",
+    "soccer_uefa_europa_league",
+    "soccer_uefa_europa_conference_league",
+    "basketball_nba",
+    "basketball_euroleague",
+    "soccer_fifa_world_cup",
+    "soccer_uefa_nations_league",
+)
+MAX_ODDS_REQUESTS_PER_RUN = 12
 SPORT_BY_COMPETITION = {
     competition.casefold(): sport_key
     for sport_key, (_, competition) in SPORTS.items()
@@ -178,7 +195,7 @@ def api_get(path: str, params: dict[str, str], api_key: str) -> tuple[Any, dict[
 
 
 def active_sports(api_key: str) -> dict[str, tuple[str, str]]:
-    """Discover active soccer and basketball competitions."""
+    """Return active competitions from the prioritized odds list."""
     payload, _ = api_get("/sports", {}, api_key)
     if not isinstance(payload, list):
         raise RuntimeError("Réponse inattendue de l’API pour /sports.")
@@ -188,39 +205,18 @@ def active_sports(api_key: str) -> dict[str, tuple[str, str]]:
         if not isinstance(item, dict):
             continue
         key = str(item.get("key", ""))
-        if key.startswith("soccer_"):
-            sport = ("Football", str(item.get("title") or key))
-        elif key in SUPPORTED_BASKETBALL:
-            sport = ("Basketball", str(item.get("title") or key))
-        else:
+        if key not in ODDS_COMPETITION_PRIORITY:
             continue
+        sport = SPORTS[key][0], str(item.get("title") or key)
         SPORT_BY_COMPETITION[sport[1].casefold()] = key
         if item.get("active") is True:
             discovered[key] = sport
 
-    known_football = [
-        key
-        for key in SPORT_PRIORITY
-        if key in discovered and discovered[key][0] == "Football"
-    ]
-    other_football = sorted(
-        key
-        for key, (sport, _) in discovered.items()
-        if sport == "Football" and key not in known_football
-    )
-    known_basketball = [
-        key
-        for key in SPORT_PRIORITY
-        if key in discovered and discovered[key][0] == "Basketball"
-    ]
-    other_basketball = sorted(
-        key
-        for key, (sport, _) in discovered.items()
-        if sport == "Basketball" and key not in known_basketball
-    )
-    ordered_keys = known_football + other_football + known_basketball + other_basketball
-    ordered = {key: discovered[key] for key in ordered_keys}
-    return ordered
+    return {
+        key: discovered[key]
+        for key in ODDS_COMPETITION_PRIORITY
+        if key in discovered
+    }
 
 
 def date_window(match_date: date, now: datetime) -> tuple[datetime, datetime]:
@@ -283,8 +279,19 @@ def fetch_daily_panels(
     odds_requests = 0
 
     for match_date in target_dates:
+        if odds_requests >= MAX_ODDS_REQUESTS_PER_RUN:
+            print(
+                f"Information : quota de {MAX_ODDS_REQUESTS_PER_RUN} requêtes de "
+                f"cotes atteint ; le {match_date.isoformat()} est ignoré."
+            )
+            continue
         existing_for_date = grouped.get(match_date.isoformat(), {})
-        if date_is_complete(existing_for_date):
+        if existing_for_date:
+            if not date_is_complete(existing_for_date):
+                print(
+                    f"Information : le {match_date.isoformat()} est déjà présent "
+                    "dans Google Sheets ; aucun appel API ni modification."
+                )
             continue
 
         start, end = date_window(match_date, now)
@@ -294,6 +301,8 @@ def fetch_daily_panels(
         sport_stats: list[tuple[str, int]] = []
         panels: list[Panel] = []
         for sport_key in sports:
+            if odds_requests >= MAX_ODDS_REQUESTS_PER_RUN:
+                break
             params = {
                 "dateFormat": "iso",
                 "commenceTimeFrom": iso_utc(start),
@@ -1094,26 +1103,18 @@ def write_google_sheet(
                     )
                 ):
                     locked_dates.add(match_date.isoformat())
-            unlocked_incomplete = [
-                match_date
-                for match_date in incomplete
-                if match_date not in locked_dates
-            ]
-            if unlocked_incomplete:
+            if locked_dates:
+                print(
+                    "Information : les dates suivantes restent incomplètes, car les "
+                    "matchs déjà enregistrés et verrouillés ne peuvent pas être modifiés : "
+                    + ", ".join(sorted(locked_dates))
+                )
+                return
+            else:
                 raise RuntimeError(
-                    "Les dates suivantes ne peuvent pas être complétées sans modifier "
-                    "des matchs déjà verrouillés : " + ", ".join(unlocked_incomplete)
+                    "Les dates suivantes restent incomplètes : "
+                    + ", ".join(incomplete)
                 )
-            print(
-                "Information : les dates suivantes restent incomplètes, car les "
-                "matchs déjà enregistrés et verrouillés ne peuvent pas être modifiés : "
-                + ", ".join(
-                    match_date
-                    for match_date in incomplete
-                    if match_date in locked_dates
-                )
-            )
-            return
     old_count = len(old_values)
     row_count = len(merged_rows)
     padded_rows = [
@@ -1343,8 +1344,15 @@ def main() -> int:
     missing_dates = [
         match_date
         for match_date in target_dates
-        if not date_is_complete(existing_by_date.get(match_date.isoformat(), {}))
+        if match_date.isoformat() not in existing_by_date
     ]
+    for match_date in target_dates:
+        existing_for_date = existing_by_date.get(match_date.isoformat(), {})
+        if existing_for_date and not date_is_complete(existing_for_date):
+            print(
+                f"Information : le {match_date.isoformat()} est déjà présent "
+                "dans Google Sheets ; aucun appel API ni modification."
+            )
     panels_by_date: dict[date, list[Panel]] = {}
     remaining: list[str] = []
     odds_requests = 0
@@ -1366,13 +1374,15 @@ def main() -> int:
         print(f"Crédits restants selon l’API : {remaining[-1]}.")
     if args.dry_run:
         print("\nMode dry-run : Google Sheets n’a pas été modifié.")
-    elif missing_dates:
+    elif panels_by_date:
         rows = [list(SHEET_HEADERS)]
         for panels in panels_by_date.values():
             rows.extend(panels_to_sheet_rows(panels)[1:])
-        write_google_sheet(rows, now, worksheet, missing_dates)
+        write_google_sheet(rows, now, worksheet, list(panels_by_date))
+    elif missing_dates:
+        print("\nAucun pronostic généré ; Google Sheets n’a pas été modifié.")
     else:
-        print("\nLes dates J, J+1 et J+2 sont déjà complètes ; aucune modification.")
+        print("\nLes dates J, J+1 et J+2 sont déjà présentes ; aucune modification.")
     return 0
 
 

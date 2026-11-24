@@ -262,6 +262,8 @@ class PanelTests(unittest.TestCase):
             {"key": "soccer_epl", "group": "Soccer", "title": "Premier League", "active": True},
             {"key": "soccer_italy_serie_b", "group": "Soccer", "title": "Serie B", "active": True},
             {"key": "soccer_inactive", "group": "Soccer", "title": "Inactive", "active": False},
+            {"key": "soccer_fifa_world_cup", "group": "Soccer", "title": "World Cup", "active": True},
+            {"key": "soccer_uefa_nations_league", "group": "Soccer", "title": "Nations League", "active": False},
             {"key": "basketball_nba", "group": "Basketball", "title": "NBA", "active": True},
             {"key": "basketball_euroleague", "group": "Basketball", "title": "EuroLeague", "active": True},
             {"key": "basketball_ncaab", "group": "Basketball", "title": "NCAAB", "active": True},
@@ -275,11 +277,12 @@ class PanelTests(unittest.TestCase):
         self.assertEqual(
             list(sports),
             [
-                "soccer_epl", "soccer_italy_serie_b", "soccer_new_league",
-                "basketball_nba", "basketball_euroleague",
+                "soccer_epl", "basketball_nba", "basketball_euroleague",
+                "soccer_fifa_world_cup",
             ],
         )
-        self.assertEqual(sports["soccer_new_league"], ("Football", "New League"))
+        self.assertNotIn("soccer_italy_serie_b", sports)
+        self.assertNotIn("soccer_uefa_nations_league", sports)
         api_get.assert_called_once_with("/sports", {}, "test-key")
 
     def test_sheet_date_requires_three_complete_unique_panels(self):
@@ -402,6 +405,63 @@ class PanelTests(unittest.TestCase):
         self.assertEqual(remaining, ["499"])
         self.assertEqual(api_get.call_count, 2)
 
+    def test_daily_fetch_skips_any_date_already_present_in_sheets(self):
+        match_date = datetime(2026, 11, 24, 12, tzinfo=timezone.utc).date()
+        existing = [
+            list(SHEET_HEADERS),
+            [
+                "2026-11-24", "1", "En cours", "Football",
+                "Premier League", "Locked - Match", "Vainqueur 1",
+                "1,30", "07:00", "1,30", "", "",
+            ],
+        ]
+        output = StringIO()
+
+        with patch("generate_pronos.api_get") as api_get, redirect_stdout(output):
+            panels_by_date, _, request_count = fetch_daily_panels(
+                "test-key",
+                [match_date],
+                datetime(2026, 11, 24, 8, tzinfo=timezone.utc),
+                {"soccer_epl": ("Football", "Premier League")},
+                existing,
+            )
+
+        self.assertEqual(panels_by_date, {})
+        self.assertEqual(request_count, 0)
+        api_get.assert_not_called()
+        self.assertIn("aucun appel API ni modification", output.getvalue())
+
+    def test_daily_fetch_caps_odds_requests_across_dates(self):
+        target_dates = [
+            datetime(2026, 11, 24, 12, tzinfo=timezone.utc).date(),
+            datetime(2026, 11, 25, 12, tzinfo=timezone.utc).date(),
+        ]
+        sports = {
+            f"soccer_competition_{index}": ("Football", f"Competition {index}")
+            for index in range(14)
+        }
+        event = event_fixture()
+
+        def fake_api_get(path, params, api_key):
+            return ([event], {}) if path.endswith("/events") else ([], {})
+
+        with patch("generate_pronos.api_get", side_effect=fake_api_get) as api_get:
+            _, _, request_count = fetch_daily_panels(
+                "test-key",
+                target_dates,
+                datetime(2026, 11, 24, 8, tzinfo=timezone.utc),
+                sports,
+                [],
+            )
+
+        odds_calls = [
+            request
+            for request in api_get.call_args_list
+            if request.args[0].endswith("/odds")
+        ]
+        self.assertEqual(request_count, 12)
+        self.assertEqual(len(odds_calls), 12)
+
     def test_sheet_merge_keeps_recent_history_and_locked_matches(self):
         now = datetime(2026, 11, 24, 8, tzinfo=timezone.utc)
         header = [
@@ -520,7 +580,10 @@ class PanelTests(unittest.TestCase):
                 rows,
                 datetime(2026, 11, 24, 8, tzinfo=timezone.utc),
                 worksheet,
-                [datetime(2026, 11, 24).date()],
+                [
+                    datetime(2026, 11, 24).date(),
+                    datetime(2026, 11, 25).date(),
+                ],
             )
 
         self.assertIn("Information :", output.getvalue())
