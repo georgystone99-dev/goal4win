@@ -1,6 +1,8 @@
-import unittest
+from contextlib import redirect_stdout
 from dataclasses import replace
 from datetime import datetime, timezone
+from io import StringIO
+import unittest
 from unittest.mock import patch
 
 from generate_pronos import (
@@ -191,14 +193,25 @@ class PanelTests(unittest.TestCase):
         response = [
             {"key": "soccer_new_league", "group": "Soccer", "title": "New League", "active": True},
             {"key": "soccer_epl", "group": "Soccer", "title": "Premier League", "active": True},
+            {"key": "soccer_italy_serie_b", "group": "Soccer", "title": "Serie B", "active": True},
             {"key": "soccer_inactive", "group": "Soccer", "title": "Inactive", "active": False},
             {"key": "basketball_nba", "group": "Basketball", "title": "NBA", "active": True},
+            {"key": "basketball_euroleague", "group": "Basketball", "title": "EuroLeague", "active": True},
             {"key": "basketball_other", "group": "Basketball", "title": "Other", "active": True},
+            {"key": "americanfootball_nfl", "group": "Soccer", "title": "NFL", "active": True},
+            {"key": "baseball_mlb", "group": "Basketball", "title": "MLB", "active": True},
+            {"key": "football_soccer_league", "group": "Soccer", "title": "Wrong prefix", "active": True},
         ]
         with patch("generate_pronos.api_get", return_value=(response, {})) as api_get:
             sports = active_sports("test-key")
 
-        self.assertEqual(list(sports), ["soccer_epl", "soccer_new_league", "basketball_nba"])
+        self.assertEqual(
+            list(sports),
+            [
+                "soccer_epl", "soccer_italy_serie_b", "soccer_new_league",
+                "basketball_nba", "basketball_euroleague", "basketball_other",
+            ],
+        )
         self.assertEqual(sports["soccer_new_league"], ("Football", "New League"))
         api_get.assert_called_once_with("/sports", {}, "test-key")
 
@@ -235,6 +248,58 @@ class PanelTests(unittest.TestCase):
             "existing",
             {item.event_id for panel in panels for item in panel.selections},
         )
+
+    def test_daily_panels_use_two_basketball_picks_when_football_is_sparse(self):
+        candidates = [selection(f"f-{index}") for index in range(6)]
+        candidates.extend(
+            selection(
+                f"b-{index}",
+                sport="Basketball",
+                probability=0.80,
+                odds=1.30,
+            )
+            for index in range(6)
+        )
+
+        panels = build_daily_panels(candidates, {})
+
+        self.assertTrue(all(len(panel.selections) == 4 for panel in panels))
+        self.assertTrue(
+            all(
+                sum(item.sport == "Basketball" for item in panel.selections) == 2
+                for panel in panels
+            )
+        )
+        self.assertEqual(
+            len({item.event_id for panel in panels for item in panel.selections}),
+            12,
+        )
+
+    def test_daily_fetch_keeps_available_picks_and_warns_after_sport_stats(self):
+        match_date = datetime(2026, 11, 24, 12, tzinfo=timezone.utc).date()
+        event = event_fixture()
+        event["commence_time"] = "2026-11-24T17:00:00Z"
+
+        def fake_api_get(path, params, api_key):
+            return ([event], {}) if path.endswith("/events") else ([event], {})
+
+        output = StringIO()
+        with patch("generate_pronos.api_get", side_effect=fake_api_get), redirect_stdout(output):
+            panels_by_date, _, _ = fetch_daily_panels(
+                "test-key",
+                [match_date],
+                datetime(2026, 11, 24, 8, tzinfo=timezone.utc),
+                {"soccer_epl": ("Football", "Premier League")},
+                [],
+            )
+
+        self.assertEqual(
+            [len(panel.selections) for panel in panels_by_date[match_date]],
+            [1, 0, 0],
+        )
+        log = output.getvalue()
+        self.assertLess(log.index("sélection(s) admissible(s)"), log.index("Avertissement"))
+        self.assertIn("seront tout de même publiés", log)
 
     def test_daily_fetch_stops_after_twelve_picks_for_date(self):
         match_date = datetime(2026, 11, 24, 12, tzinfo=timezone.utc).date()

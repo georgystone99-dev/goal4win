@@ -48,14 +48,29 @@ SPORTS = {
     "soccer_spain_la_liga": ("Football", "Liga"),
     "soccer_germany_bundesliga": ("Football", "Bundesliga"),
     "soccer_italy_serie_a": ("Football", "Serie A"),
+    "soccer_italy_serie_b": ("Football", "Serie B"),
     "soccer_france_ligue_one": ("Football", "Ligue 1"),
+    "soccer_france_ligue_two": ("Football", "Ligue 2"),
+    "soccer_germany_bundesliga2": ("Football", "2. Bundesliga"),
+    "soccer_spain_segunda_division": ("Football", "Segunda División"),
     "soccer_uefa_champs_league": ("Football", "Ligue des champions"),
     "soccer_uefa_europa_league": ("Football", "Ligue Europa"),
+    "soccer_uefa_europa_conference_league": ("Football", "Ligue Conférence"),
+    "soccer_uefa_nations_league": ("Football", "Ligue des Nations"),
+    "soccer_fifa_world_cup_qualifiers_europe": ("Football", "Qualifications Coupe du Monde"),
+    "soccer_uefa_european_championship": ("Football", "Euro"),
+    "soccer_fifa_world_cup": ("Football", "Coupe du Monde"),
     "soccer_portugal_primeira_liga": ("Football", "Primeira Liga"),
     "soccer_netherlands_eredivisie": ("Football", "Eredivisie"),
     "soccer_belgium_first_div": ("Football", "First Division A"),
     "soccer_turkey_super_league": ("Football", "Süper Lig"),
     "soccer_efl_champ": ("Football", "Championship"),
+    "soccer_fa_cup": ("Football", "FA Cup"),
+    "soccer_england_efl_cup": ("Football", "EFL Cup"),
+    "soccer_italy_coppa_italia": ("Football", "Coppa Italia"),
+    "soccer_spain_copa_del_rey": ("Football", "Copa del Rey"),
+    "soccer_germany_dfb_pokal": ("Football", "DFB-Pokal"),
+    "soccer_france_coupe_de_france": ("Football", "Coupe de France"),
     "soccer_spl": ("Football", "Scottish Premiership"),
     "soccer_switzerland_superleague": ("Football", "Swiss Super League"),
     "soccer_austria_bundesliga": ("Football", "Austrian Bundesliga"),
@@ -64,11 +79,6 @@ SPORTS = {
     "soccer_sweden_allsvenskan": ("Football", "Allsvenskan"),
     "soccer_denmark_superliga": ("Football", "Superliga"),
     "soccer_poland_ekstraklasa": ("Football", "Ekstraklasa"),
-    "soccer_uefa_europa_conference_league": ("Football", "Ligue Conférence"),
-    "soccer_uefa_nations_league": ("Football", "Ligue des Nations"),
-    "soccer_fifa_world_cup_qualifiers_europe": ("Football", "Qualifications Coupe du Monde"),
-    "soccer_uefa_european_championship": ("Football", "Euro"),
-    "soccer_fifa_world_cup": ("Football", "Coupe du Monde"),
     "basketball_nba": ("Basketball", "NBA"),
     "basketball_euroleague": ("Basketball", "EuroLeague"),
 }
@@ -150,7 +160,7 @@ def api_get(path: str, params: dict[str, str], api_key: str) -> tuple[Any, dict[
 
 
 def active_sports(api_key: str) -> dict[str, tuple[str, str]]:
-    """Discover active soccer leagues and the supported basketball competitions for free."""
+    """Discover active soccer and basketball competitions."""
     payload, _ = api_get("/sports", {}, api_key)
     if not isinstance(payload, list):
         raise RuntimeError("Réponse inattendue de l’API pour /sports.")
@@ -160,10 +170,9 @@ def active_sports(api_key: str) -> dict[str, tuple[str, str]]:
         if not isinstance(item, dict):
             continue
         key = str(item.get("key", ""))
-        group = normalized(item.get("group", ""))
-        if key.startswith("soccer_") or "soccer" in group or "football" in group:
+        if key.startswith("soccer_"):
             sport = ("Football", str(item.get("title") or key))
-        elif key in {"basketball_nba", "basketball_euroleague"}:
+        elif key.startswith("basketball_"):
             sport = ("Basketball", str(item.get("title") or key))
         else:
             continue
@@ -186,7 +195,12 @@ def active_sports(api_key: str) -> dict[str, tuple[str, str]]:
         for key in SPORT_PRIORITY
         if key in discovered and discovered[key][0] == "Basketball"
     ]
-    ordered_keys = known_football + other_football + known_basketball
+    other_basketball = sorted(
+        key
+        for key, (sport, _) in discovered.items()
+        if sport == "Basketball" and key not in known_basketball
+    )
+    ordered_keys = known_football + other_football + known_basketball + other_basketball
     ordered = {key: discovered[key] for key in ordered_keys}
     return ordered
 
@@ -257,7 +271,8 @@ def fetch_daily_panels(
         if end < start:
             continue
         day_events: list[dict[str, Any]] = []
-        selections: list[Selection] = []
+        sport_stats: list[tuple[str, int]] = []
+        panels: list[Panel] = []
         for sport_key in sports:
             params = {
                 "dateFormat": "iso",
@@ -272,6 +287,7 @@ def fetch_daily_panels(
                     f"Réponse inattendue de l’API pour {sport_key}/events."
                 )
             if not event_payload:
+                sport_stats.append((sport_key, 0))
                 continue
 
             odds_params = {
@@ -290,11 +306,23 @@ def fetch_daily_panels(
                 )
             if headers.get("x-requests-remaining") is not None:
                 remaining.append(headers["x-requests-remaining"])
-            day_events.extend(
+            sport_events = [
                 event
                 for event in odds_payload
                 if isinstance(event, dict)
                 and is_in_window(event.get("commence_time"), start, end)
+            ]
+            day_events.extend(sport_events)
+            sport_selections = selections_from_events(sport_events, sports)
+            sport_stats.append(
+                (
+                    sport_key,
+                    sum(
+                        selection.commence_time.astimezone(TIMEZONE).date()
+                        == match_date
+                        for selection in sport_selections
+                    ),
+                )
             )
             selections = selections_from_events(day_events, sports)
             day_selections = [
@@ -303,10 +331,6 @@ def fetch_daily_panels(
                 if selection.commence_time.astimezone(TIMEZONE).date() == match_date
             ]
             panels = build_daily_panels(day_selections, existing_for_date)
-            print(
-                f"{match_date.isoformat()} / {sport_key}: "
-                f"{len(day_selections)} sélection(s) admissible(s)."
-            )
             if all(
                 len(existing_for_date.get(str(panel.number), []))
                 + len(panel.selections)
@@ -315,21 +339,33 @@ def fetch_daily_panels(
             ):
                 break
 
+        for sport_key, selection_count in sport_stats:
+            print(
+                f"{match_date.isoformat()} / {sport_key}: "
+                f"{selection_count} sélection(s) admissible(s)."
+            )
         day_selections = [
-            selection
-            for selection in selections
+            selection for selection in selections_from_events(day_events, sports)
             if selection.commence_time.astimezone(TIMEZONE).date() == match_date
         ]
         panels = build_daily_panels(day_selections, existing_for_date)
-        if not all(
-            len(existing_for_date.get(str(panel.number), []))
-            + len(panel.selections)
-            == 4
+        selected_matches = {
+            fixture_key_from_match(row[5])
+            for rows in existing_for_date.values()
+            for row in rows
+            if len(row) > 5 and row[5].strip()
+        }
+        selected_matches.update(
+            fixture_key(selection.home, selection.away)
             for panel in panels
-        ):
-            raise RuntimeError(
-                f"12 matchs uniques (4 par panneau) ne sont pas disponibles "
-                f"pour le {match_date.isoformat()} ; Google Sheets n’a pas été modifié."
+            for selection in panel.selections
+        )
+        selected_count = len(selected_matches)
+        if selected_count < 12:
+            print(
+                f"Avertissement : {selected_count} sélection(s) unique(s) seulement "
+                f"pour le {match_date.isoformat()} ; les panneaux disponibles "
+                "seront tout de même publiés."
             )
         panels_by_date[match_date] = panels
     return panels_by_date, remaining, odds_requests
@@ -601,6 +637,26 @@ def build_panels(selections: list[Selection]) -> list[Panel]:
         used_events.add(selection.event_id)
         used_matches.add(match)
 
+    for selection in basketball:
+        match = fixture_key(selection.home, selection.away)
+        if selection.event_id in used_events or match in used_matches:
+            continue
+        available = [
+            panel
+            for panel in panels
+            if len(panel.selections) < 4
+            and sum(item.sport == "Basketball" for item in panel.selections) < 2
+        ]
+        if not available:
+            break
+        panel = min(
+            available,
+            key=lambda item: (len(item.selections), average_probability(item.selections), item.number),
+        )
+        panel.selections.append(selection)
+        used_events.add(selection.event_id)
+        used_matches.add(match)
+
     for panel in panels:
         panel.selections.sort(
             key=lambda selection: (-selection.probability, selection.commence_time)
@@ -640,7 +696,7 @@ def build_daily_panels(
                 existing_matches.add(fixture_key_from_match(row[5]))
 
     if any(
-        football_counts[number] > 3 or basketball_counts[number] > 1
+        football_counts[number] > 4 or basketball_counts[number] > 2
         for number in (1, 2, 3)
     ):
         raise RuntimeError("La composition d’un panneau existant ne peut pas être complétée.")
@@ -679,14 +735,21 @@ def build_daily_panels(
             return True
         return False
 
-    for panel in panels:
-        number = panel.number
-        while (
-            football_counts[number] < 3
-            and occupied_counts[number] < 4
-            and add_next(number, football)
-        ):
-            pass
+    while True:
+        available = [
+            panel
+            for panel in panels
+            if football_counts[panel.number] < 3
+            and occupied_counts[panel.number] < 4
+        ]
+        if not available:
+            break
+        panel = min(
+            available,
+            key=lambda item: (football_counts[item.number], item.number),
+        )
+        if not add_next(panel.number, football):
+            break
 
     for panel in panels:
         number = panel.number
@@ -705,6 +768,26 @@ def build_daily_panels(
             and add_next(number, football)
         ):
             pass
+
+    while True:
+        available = [
+            panel
+            for panel in panels
+            if basketball_counts[panel.number] < 2
+            and occupied_counts[panel.number] < 4
+        ]
+        if not available:
+            break
+        panel = min(
+            available,
+            key=lambda item: (
+                occupied_counts[item.number],
+                basketball_counts[item.number],
+                item.number,
+            ),
+        )
+        if not add_next(panel.number, basketball):
+            break
 
     for panel in panels:
         panel.selections.sort(
