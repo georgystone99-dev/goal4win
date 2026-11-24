@@ -28,6 +28,7 @@ MAX_ODDS = 1.50
 MIN_BOOKMAKERS = 3
 MIN_BASKETBALL_PROBABILITY = 0.75
 MAX_CONSENSUS_SPREAD = 0.06
+SUPPORTED_BASKETBALL = {"basketball_nba", "basketball_euroleague"}
 SHEET_HEADERS = (
     "Date",
     "Type de Case",
@@ -172,7 +173,7 @@ def active_sports(api_key: str) -> dict[str, tuple[str, str]]:
         key = str(item.get("key", ""))
         if key.startswith("soccer_"):
             sport = ("Football", str(item.get("title") or key))
-        elif key.startswith("basketball_"):
+        elif key in SUPPORTED_BASKETBALL:
             sport = ("Basketball", str(item.get("title") or key))
         else:
             continue
@@ -472,6 +473,15 @@ def quote_candidates(
             )
 
         for key in expected:
+            if (
+                sport == "Football"
+                and market_key == "totals"
+                and not (
+                    (key == "over" and point == 1.5)
+                    or (key == "under" and point == 3.5)
+                )
+            ):
+                continue
             quotes = [prices[key] for prices in valid_books]
             average_odds = statistics.mean(quotes)
             if not MIN_ODDS <= average_odds <= MAX_ODDS:
@@ -1032,7 +1042,8 @@ def write_google_sheet(
 ) -> None:
     worksheet = worksheet or open_google_worksheet()
     old_values = worksheet.get_all_values()
-    merged_rows = merge_sheet_rows(old_values, rows, now or datetime.now(timezone.utc))
+    current_time = now or datetime.now(timezone.utc)
+    merged_rows = merge_sheet_rows(old_values, rows, current_time)
     if required_dates:
         grouped = sheet_date_counts(merged_rows)
         incomplete = [
@@ -1041,10 +1052,49 @@ def write_google_sheet(
             if not date_is_complete(grouped.get(match_date.isoformat(), {}))
         ]
         if incomplete:
-            raise RuntimeError(
-                "Les dates suivantes ne peuvent pas être complétées sans modifier "
-                "des matchs déjà verrouillés : " + ", ".join(incomplete)
+            source_indexes = {}
+            if old_values:
+                source_indexes = {
+                    normalized(name): index
+                    for index, name in enumerate(old_values[0])
+                }
+            locked_dates: set[str] = set()
+            for raw_row in old_values[1:]:
+                row = normalize_row_from(raw_row, source_indexes)
+                match_date = _sheet_date(row[0])
+                if match_date is None or match_date.isoformat() not in incomplete:
+                    continue
+                status = normalized(row[2])
+                starts_at = _row_start_time(row)
+                if (
+                    status not in {"", normalized("À venir")}
+                    or bool(row[10])
+                    or (
+                        starts_at is not None
+                        and starts_at <= current_time.astimezone(TIMEZONE)
+                    )
+                ):
+                    locked_dates.add(match_date.isoformat())
+            unlocked_incomplete = [
+                match_date
+                for match_date in incomplete
+                if match_date not in locked_dates
+            ]
+            if unlocked_incomplete:
+                raise RuntimeError(
+                    "Les dates suivantes ne peuvent pas être complétées sans modifier "
+                    "des matchs déjà verrouillés : " + ", ".join(unlocked_incomplete)
+                )
+            print(
+                "Information : les dates suivantes restent incomplètes, car les "
+                "matchs déjà enregistrés et verrouillés ne peuvent pas être modifiés : "
+                + ", ".join(
+                    match_date
+                    for match_date in incomplete
+                    if match_date in locked_dates
+                )
             )
+            return
     old_count = len(old_values)
     row_count = len(merged_rows)
     padded_rows = [

@@ -8,6 +8,7 @@ from unittest.mock import patch
 from generate_pronos import (
     Panel,
     Selection,
+    SHEET_HEADERS,
     active_sports,
     build_panels,
     build_daily_panels,
@@ -18,6 +19,7 @@ from generate_pronos import (
     panels_to_sheet_rows,
     quote_candidates,
     update_sheet_results,
+    write_google_sheet,
 )
 
 
@@ -39,8 +41,12 @@ def event_fixture():
                     {
                         "key": "totals",
                         "outcomes": [
+                            {"name": "Over", "point": 1.5, "price": 1.40},
+                            {"name": "Under", "point": 1.5, "price": 3.0},
                             {"name": "Over", "point": 2.5, "price": 1.40},
                             {"name": "Under", "point": 2.5, "price": 2.8},
+                            {"name": "Over", "point": 3.5, "price": 2.7},
+                            {"name": "Under", "point": 3.5, "price": 1.30},
                         ],
                     },
                 ],
@@ -79,7 +85,9 @@ class QuoteTests(unittest.TestCase):
         by_pick = {candidate.pick: candidate for candidate in candidates}
 
         self.assertIn("Vainqueur 1", by_pick)
-        self.assertIn("Total +2,5", by_pick)
+        self.assertIn("Total +1,5", by_pick)
+        self.assertIn("Total -3,5", by_pick)
+        self.assertNotIn("Total +2,5", by_pick)
         self.assertEqual(by_pick["Vainqueur 1"].bookmaker_count, 3)
         self.assertGreater(by_pick["Vainqueur 1"].probability, 0.6)
 
@@ -91,12 +99,19 @@ class QuoteTests(unittest.TestCase):
                     outcome["price"] = 1.20
                 elif outcome["name"] == "Away FC":
                     outcome["price"] = 1.50
+            for outcome in bookmaker["markets"][1]["outcomes"]:
+                if outcome["name"] == "Over" and outcome["point"] == 1.5:
+                    outcome["price"] = 1.20
+                elif outcome["name"] == "Under" and outcome["point"] == 3.5:
+                    outcome["price"] = 1.50
 
         candidates = quote_candidates(event, "soccer_epl")
 
         by_pick = {candidate.pick: candidate for candidate in candidates}
         self.assertEqual(by_pick["Vainqueur 1"].odds, 1.20)
         self.assertEqual(by_pick["Vainqueur 2"].odds, 1.50)
+        self.assertEqual(by_pick["Total +1,5"].odds, 1.20)
+        self.assertEqual(by_pick["Total -3,5"].odds, 1.50)
 
 
 class ResultTests(unittest.TestCase):
@@ -106,6 +121,13 @@ class ResultTests(unittest.TestCase):
         self.assertEqual(evaluate_pick("Double chance 1X", 1, 1), "Gagné")
         self.assertEqual(evaluate_pick("Total +2,5", 2, 1), "Gagné")
         self.assertEqual(evaluate_pick("Total -2,5", 2, 1), "Perdu")
+
+    def test_evaluates_half_goal_totals_on_both_sides_of_the_line(self):
+        self.assertEqual(evaluate_pick("Total +1,5", 1, 0), "Perdu")
+        self.assertEqual(evaluate_pick("Total +1,5", 1, 1), "Gagné")
+        self.assertEqual(evaluate_pick("Total +1.5", 1, 1), "Gagné")
+        self.assertEqual(evaluate_pick("Total -3,5", 2, 1), "Gagné")
+        self.assertEqual(evaluate_pick("Total -3.5", 2, 2), "Perdu")
 
     def test_updates_completed_scores_only_for_present_competitions(self):
         class FakeWorksheet:
@@ -197,7 +219,7 @@ class PanelTests(unittest.TestCase):
             {"key": "soccer_inactive", "group": "Soccer", "title": "Inactive", "active": False},
             {"key": "basketball_nba", "group": "Basketball", "title": "NBA", "active": True},
             {"key": "basketball_euroleague", "group": "Basketball", "title": "EuroLeague", "active": True},
-            {"key": "basketball_other", "group": "Basketball", "title": "Other", "active": True},
+            {"key": "basketball_ncaab", "group": "Basketball", "title": "NCAAB", "active": True},
             {"key": "americanfootball_nfl", "group": "Soccer", "title": "NFL", "active": True},
             {"key": "baseball_mlb", "group": "Basketball", "title": "MLB", "active": True},
             {"key": "football_soccer_league", "group": "Soccer", "title": "Wrong prefix", "active": True},
@@ -209,7 +231,7 @@ class PanelTests(unittest.TestCase):
             list(sports),
             [
                 "soccer_epl", "soccer_italy_serie_b", "soccer_new_league",
-                "basketball_nba", "basketball_euroleague", "basketball_other",
+                "basketball_nba", "basketball_euroleague",
             ],
         )
         self.assertEqual(sports["soccer_new_league"], ("Football", "New League"))
@@ -413,6 +435,52 @@ class PanelTests(unittest.TestCase):
         )
         self.assertEqual(rows[1][8], "18:00")
         self.assertEqual(rows[1][5], "Home f-1 - Away f-1")
+
+    def test_locked_incomplete_date_is_reported_without_failing_or_writing(self):
+        class FakeWorksheet:
+            title = "Matchs"
+
+            def __init__(self):
+                self.values = [
+                    list(SHEET_HEADERS),
+                    [
+                        "2026-11-24", "1", "En cours", "Football",
+                        "Premier League", "Locked - Match", "Vainqueur 1",
+                        "1,30", "07:00", "1,30", "", "",
+                    ],
+                ]
+                self.updates = 0
+
+            def get_all_values(self):
+                return self.values
+
+            def update(self, **kwargs):
+                self.updates += 1
+
+        worksheet = FakeWorksheet()
+        rows = [list(SHEET_HEADERS)]
+        for panel in ("1", "2", "3"):
+            for index in range(4):
+                rows.append(
+                    [
+                        "2026-11-24", panel, "À venir", "Football",
+                        "Premier League", f"Home {panel}-{index} - Away {panel}-{index}",
+                        "Vainqueur 1", "1,30", "18:00", "1,30", "", "",
+                    ]
+                )
+        output = StringIO()
+
+        with redirect_stdout(output):
+            write_google_sheet(
+                rows,
+                datetime(2026, 11, 24, 8, tzinfo=timezone.utc),
+                worksheet,
+                [datetime(2026, 11, 24).date()],
+            )
+
+        self.assertIn("Information :", output.getvalue())
+        self.assertIn("verrouillés", output.getvalue())
+        self.assertEqual(worksheet.updates, 0)
 
 
 if __name__ == "__main__":
