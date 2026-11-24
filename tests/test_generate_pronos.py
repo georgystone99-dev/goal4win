@@ -1,14 +1,16 @@
 from contextlib import redirect_stdout
 from dataclasses import replace
 from datetime import datetime, timezone
-from io import StringIO
+from io import BytesIO, StringIO
 import unittest
-from unittest.mock import patch
+from urllib.error import HTTPError
+from unittest.mock import call, MagicMock, patch
 
 from generate_pronos import (
     Panel,
     Selection,
     SHEET_HEADERS,
+    api_get,
     active_sports,
     build_panels,
     build_daily_panels,
@@ -21,6 +23,49 @@ from generate_pronos import (
     update_sheet_results,
     write_google_sheet,
 )
+
+
+class ApiRequestTests(unittest.TestCase):
+    def test_api_get_waits_before_request_and_retries_frequency_limit(self):
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b"[]"
+        response.headers = {}
+        rate_limit = HTTPError(
+            "https://api.the-odds-api.com/v4/sports",
+            429,
+            "Too Many Requests",
+            {},
+            BytesIO(b'{"error_code":"EXCEEDED_FREQ_LIMIT"}'),
+        )
+
+        with patch("generate_pronos.urlopen", side_effect=[rate_limit, response]) as urlopen, patch(
+            "generate_pronos.time.sleep"
+        ) as sleep:
+            payload, headers = api_get("/sports", {}, "test-key")
+
+        self.assertEqual(payload, [])
+        self.assertEqual(headers, {})
+        self.assertEqual(urlopen.call_count, 2)
+        self.assertEqual(sleep.call_args_list, [call(1.2), call(3), call(1.2)])
+
+    def test_api_get_does_not_retry_other_http_errors(self):
+        error = HTTPError(
+            "https://api.the-odds-api.com/v4/sports",
+            429,
+            "Too Many Requests",
+            {},
+            BytesIO(b'{"error_code":"OTHER_ERROR"}'),
+        )
+
+        with patch("generate_pronos.urlopen", side_effect=error) as urlopen, patch(
+            "generate_pronos.time.sleep"
+        ) as sleep:
+            with self.assertRaisesRegex(RuntimeError, "HTTP 429"):
+                api_get("/sports", {}, "test-key")
+
+        urlopen.assert_called_once()
+        sleep.assert_called_once_with(1.2)
 
 
 def event_fixture():

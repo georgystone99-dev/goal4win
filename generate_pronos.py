@@ -9,9 +9,10 @@ import os
 import re
 import statistics
 import sys
+import time
 import unicodedata
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -23,6 +24,8 @@ from zoneinfo import ZoneInfo
 API_BASE = "https://api.the-odds-api.com/v4"
 TIMEZONE = ZoneInfo("Africa/Douala")
 MARKETS = ("h2h", "totals")
+API_REQUEST_DELAY = 1.2
+API_RATE_LIMIT_RETRY_DELAY = 3
 MIN_ODDS = 1.20
 MAX_ODDS = 1.50
 MIN_BOOKMAKERS = 3
@@ -143,21 +146,35 @@ def iso_utc(value: datetime) -> str:
 def api_get(path: str, params: dict[str, str], api_key: str) -> tuple[Any, dict[str, str]]:
     query = urlencode({**params, "apiKey": api_key})
     request_url = f"{API_BASE}{path}?{query}"
-    try:
-        with urlopen(request_url, timeout=30) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-            headers = {key.lower(): value for key, value in response.headers.items()}
-    except HTTPError as exc:
-        message = exc.read().decode("utf-8", errors="replace").strip()
-        raise RuntimeError(
-            f"The Odds API a renvoyé HTTP {exc.code} pour {path}: "
-            f"{message or exc.reason}"
-        ) from exc
-    except URLError as exc:
-        raise RuntimeError(f"Connexion à The Odds API impossible : {exc.reason}") from exc
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Réponse JSON invalide de The Odds API ({path}).") from exc
-    return payload, headers
+    rate_limit_retry = False
+    while True:
+        time.sleep(API_REQUEST_DELAY)
+        try:
+            with urlopen(request_url, timeout=30) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+                headers = {key.lower(): value for key, value in response.headers.items()}
+        except HTTPError as exc:
+            message = exc.read().decode("utf-8", errors="replace").strip()
+            exc.close()
+            if (
+                exc.code == 429
+                and "EXCEEDED_FREQ_LIMIT" in message
+                and not rate_limit_retry
+            ):
+                rate_limit_retry = True
+                time.sleep(API_RATE_LIMIT_RETRY_DELAY)
+                continue
+            raise RuntimeError(
+                f"The Odds API a renvoyé HTTP {exc.code} pour {path}: "
+                f"{message or exc.reason}"
+            ) from exc
+        except URLError as exc:
+            raise RuntimeError(
+                f"Connexion à The Odds API impossible : {exc.reason}"
+            ) from exc
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Réponse JSON invalide de The Odds API ({path}).") from exc
+        return payload, headers
 
 
 def active_sports(api_key: str) -> dict[str, tuple[str, str]]:
@@ -207,8 +224,10 @@ def active_sports(api_key: str) -> dict[str, tuple[str, str]]:
 
 
 def date_window(match_date: date, now: datetime) -> tuple[datetime, datetime]:
-    local_start = datetime.combine(match_date, time.min, tzinfo=TIMEZONE)
-    local_end = datetime.combine(match_date + timedelta(days=1), time.min, tzinfo=TIMEZONE)
+    local_start = datetime.combine(match_date, datetime_time.min, tzinfo=TIMEZONE)
+    local_end = datetime.combine(
+        match_date + timedelta(days=1), datetime_time.min, tzinfo=TIMEZONE
+    )
     start = max(now, local_start.astimezone(timezone.utc))
     end = local_end.astimezone(timezone.utc) - timedelta(seconds=1)
     return start, end
