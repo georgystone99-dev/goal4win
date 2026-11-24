@@ -6,10 +6,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import statistics
 import sys
+import unicodedata
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -19,12 +21,12 @@ from zoneinfo import ZoneInfo
 
 
 API_BASE = "https://api.the-odds-api.com/v4"
-TIMEZONE = ZoneInfo("Europe/Paris")
+TIMEZONE = ZoneInfo("Africa/Douala")
 MARKETS = ("h2h", "totals")
 MIN_ODDS = 1.20
 MAX_ODDS = 1.50
 MIN_BOOKMAKERS = 3
-MAX_BASKETBALL_ODDS = 1.32
+MIN_BASKETBALL_PROBABILITY = 0.75
 MAX_CONSENSUS_SPREAD = 0.06
 SHEET_HEADERS = (
     "Date",
@@ -49,8 +51,17 @@ SPORTS = {
     "soccer_france_ligue_one": ("Football", "Ligue 1"),
     "soccer_uefa_champs_league": ("Football", "Ligue des champions"),
     "soccer_uefa_europa_league": ("Football", "Ligue Europa"),
+    "soccer_portugal_primeira_liga": ("Football", "Primeira Liga"),
+    "soccer_netherlands_eredivisie": ("Football", "Eredivisie"),
+    "soccer_belgium_first_div": ("Football", "First Division A"),
+    "soccer_turkey_super_league": ("Football", "Süper Lig"),
+    "soccer_efl_champ": ("Football", "Championship"),
     "basketball_nba": ("Basketball", "NBA"),
     "basketball_euroleague": ("Basketball", "EuroLeague"),
+}
+SPORT_BY_COMPETITION = {
+    competition.casefold(): sport_key
+    for sport_key, (_, competition) in SPORTS.items()
 }
 DEFAULT_SPREADSHEET_ID = "11t2NRQYociuLCvE-VzicXg282XxTXDctM7oychcH5cQ"
 
@@ -141,7 +152,7 @@ def fetch_events(
         if not isinstance(payload, list):
             raise RuntimeError(f"Réponse inattendue de l’API pour {sport_key}/events.")
         if not payload:
-            print(f"{sport_key}: aucun match dans les prochaines 24 h.")
+            print(f"{sport_key}: aucun match dans la fenêtre.")
             continue
 
         odds_params = {
@@ -256,7 +267,7 @@ def quote_candidates(event: dict[str, Any], sport_key: str) -> list[Selection]:
         for key in expected:
             quotes = [prices[key] for prices in valid_books]
             average_odds = statistics.mean(quotes)
-            if not MIN_ODDS < average_odds < MAX_ODDS:
+            if not MIN_ODDS <= average_odds <= MAX_ODDS:
                 continue
             probabilities = [fair[key] for fair in fair_by_book]
             if market_key == "h2h":
@@ -347,9 +358,8 @@ def build_panels(selections: list[Selection]) -> list[Panel]:
         item
         for item in selections
         if item.sport == "Basketball"
-        and (item.odds <= MAX_BASKETBALL_ODDS or (
-            item.probability > 0.75 and item.strong_consensus
-        ))
+        and item.probability > MIN_BASKETBALL_PROBABILITY
+        and item.strong_consensus
     ]
     used_events: set[str] = set()
 
@@ -459,6 +469,122 @@ def panels_to_sheet_rows(panels: list[Panel]) -> list[list[str]]:
     return rows
 
 
+def normalized(value: Any) -> str:
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    return "".join(char for char in text if not unicodedata.combining(char)).casefold().strip()
+
+
+def match_key(row: list[str], indexes: dict[str, int]) -> tuple[str, str]:
+    return (
+        row[indexes["Date"]] if indexes["Date"] < len(row) else "",
+        normalized(row[indexes["Match"]] if indexes["Match"] < len(row) else ""),
+    )
+
+
+def merge_sheet_rows(
+    existing_rows: list[list[str]], new_rows: list[list[str]], now: datetime
+) -> list[list[str]]:
+    """Keep recent history and append only unlocked, non-duplicate upcoming picks."""
+    header = list(SHEET_HEADERS)
+    if existing_rows:
+        source_header = existing_rows[0]
+        source_indexes = {normalized(name): index for index, name in enumerate(source_header)}
+    else:
+        source_header = header
+        source_indexes = {normalized(name): index for index, name in enumerate(header)}
+
+    def normalize_row(row: list[str]) -> list[str]:
+        return [
+            row[source_indexes.get(normalized(name), -1)]
+            if source_indexes.get(normalized(name), -1) >= 0
+            and source_indexes[normalized(name)] < len(row)
+            else ""
+            for name in header
+        ]
+
+    old_data = [normalize_row(row) for row in existing_rows[1:] if any(row)]
+    cutoff = now.astimezone(TIMEZONE).date() - timedelta(days=10)
+    kept_rows = [
+        row
+        for row in old_data
+        if not row[0]
+        or not _sheet_date(row[0])
+        or _sheet_date(row[0]) >= cutoff
+    ]
+    indexes = {name: index for index, name in enumerate(header)}
+    existing_keys = {match_key(row, indexes) for row in kept_rows}
+    panel_rows: dict[tuple[str, str], list[list[str]]] = {}
+    locked_panels: set[tuple[str, str]] = set()
+    today = now.astimezone(TIMEZONE).date()
+    last_generation_date = today + timedelta(days=1)
+
+    for row in kept_rows:
+        panel_key = (row[indexes["Date"]], row[indexes["Type de Case"]])
+        row_date = _sheet_date(row[indexes["Date"]])
+        if row_date and today <= row_date <= last_generation_date:
+            panel_rows.setdefault(panel_key, []).append(row)
+            status = normalized(row[indexes["Statut global"]])
+            has_result = bool(row[indexes["Résultat"]])
+            starts_at = _row_start_time(row)
+            if (
+                status not in {"", normalized("À venir")}
+                or has_result
+                or (starts_at is not None and starts_at <= now.astimezone(TIMEZONE))
+            ):
+                locked_panels.add(panel_key)
+
+    new_indexes = {normalized(name): index for index, name in enumerate(new_rows[0])}
+    planned_count = sum(len(rows) for rows in panel_rows.values())
+    added_rows = 0
+    for raw_row in new_rows[1:]:
+        row = normalize_row_from(raw_row, new_indexes)
+        row_date = _sheet_date(row[indexes["Date"]])
+        if row_date is None or not today <= row_date <= last_generation_date:
+            continue
+        key = match_key(row, indexes)
+        if not key[1] or key in existing_keys or planned_count >= 12:
+            continue
+        panel_key = (row[indexes["Date"]], row[indexes["Type de Case"]])
+        current_panel_rows = panel_rows.get(panel_key, [])
+        if panel_key in locked_panels or len(current_panel_rows) >= 4:
+            continue
+        kept_rows.append(row)
+        panel_rows.setdefault(panel_key, []).append(row)
+        existing_keys.add(key)
+        planned_count += 1
+        added_rows += 1
+
+    print(f"Google Sheets : {added_rows} nouveau(x) match(s) ajouté(s), historique conservé.")
+    return [header, *kept_rows]
+
+
+def normalize_row_from(row: list[str], indexes: dict[str, int]) -> list[str]:
+    return [
+        row[indexes[normalized(name)]]
+        if normalized(name) in indexes and indexes[normalized(name)] < len(row)
+        else ""
+        for name in SHEET_HEADERS
+    ]
+
+
+def _sheet_date(value: str) -> date | None:
+    try:
+        return date.fromisoformat(str(value).strip()[:10])
+    except ValueError:
+        return None
+
+
+def _row_start_time(row: list[str]) -> datetime | None:
+    match_date = _sheet_date(row[0])
+    if match_date is None:
+        return None
+    try:
+        match_time = datetime.strptime(row[8], "%H:%M").time()
+    except (IndexError, ValueError):
+        return None
+    return datetime.combine(match_date, match_time, tzinfo=TIMEZONE)
+
+
 def google_credentials_ready() -> bool:
     credentials_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
     credentials_path = Path("credentials.json")
@@ -478,7 +604,7 @@ def google_credentials_ready() -> bool:
     )
 
 
-def write_google_sheet(rows: list[list[str]]) -> None:
+def open_google_worksheet():
     try:
         import gspread
     except ImportError as exc:
@@ -500,20 +626,192 @@ def write_google_sheet(rows: list[list[str]]) -> None:
             if worksheet_name
             else spreadsheet.sheet1
         )
-        old_rows = len(worksheet.get_all_values())
-        row_count = max(old_rows, len(rows))
-        padded_rows = rows + [[""] * len(SHEET_HEADERS) for _ in range(row_count - len(rows))]
-        worksheet.update(
-            values=padded_rows,
-            range_name=f"A1:L{row_count}",
-            value_input_option="RAW",
-        )
+        return worksheet
     except (gspread.exceptions.GSpreadException, OSError, ValueError) as exc:
-        raise RuntimeError(f"Écriture Google Sheets impossible : {exc}") from exc
+        raise RuntimeError(f"Accès à Google Sheets impossible : {exc}") from exc
+
+
+def write_google_sheet(rows: list[list[str]], now: datetime | None = None) -> None:
+    worksheet = open_google_worksheet()
+    old_values = worksheet.get_all_values()
+    merged_rows = merge_sheet_rows(old_values, rows, now or datetime.now(timezone.utc))
+    old_count = len(old_values)
+    row_count = len(merged_rows)
+    padded_rows = [
+        row + [""] * (len(SHEET_HEADERS) - len(row))
+        for row in merged_rows
+    ]
+    worksheet.update(
+        values=padded_rows,
+        range_name=f"A1:L{row_count}",
+        value_input_option="RAW",
+    )
+    if old_count > row_count:
+        worksheet.batch_clear([f"A{row_count + 1}:L{old_count}"])
     print(
-        f"Google Sheets mis à jour : {len(rows) - 1} match(s), "
+        f"Google Sheets mis à jour : {len(merged_rows) - 1} match(s) conservés, "
         f"onglet « {worksheet.title} »."
     )
+
+
+def completed_score(event: dict[str, Any], home: str, away: str) -> tuple[int, int] | None:
+    scores = event.get("scores")
+    if not event.get("completed") or not isinstance(scores, list):
+        return None
+    by_name = {
+        normalized(item.get("name")): item.get("score")
+        for item in scores
+        if isinstance(item, dict)
+    }
+    try:
+        home_score = int(by_name[normalized(home)])
+        away_score = int(by_name[normalized(away)])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return home_score, away_score
+
+
+def evaluate_pick(pick: str, home_score: int, away_score: int) -> str:
+    label = normalized(pick)
+    if label in {"vainqueur 1", "victoire domicile", "1"}:
+        return "Gagné" if home_score > away_score else "Perdu"
+    if label in {"vainqueur 2", "victoire exterieur", "2"}:
+        return "Gagné" if away_score > home_score else "Perdu"
+    if label in {"match nul", "nul", "x"}:
+        return "Gagné" if home_score == away_score else "Perdu"
+    if "double chance" in label:
+        choice = label.replace("double chance", "").strip()
+        if choice in {"1", "1x"}:
+            won = home_score >= away_score
+        elif choice in {"2", "x2"}:
+            won = away_score >= home_score
+        elif choice == "12":
+            won = home_score != away_score
+        else:
+            return ""
+        return "Gagné" if won else "Perdu"
+    total = re.search(r"total\s*([+-])\s*(\d+(?:[,.]\d+)?)", label)
+    if total:
+        threshold = float(total.group(2).replace(",", "."))
+        actual = home_score + away_score
+        if actual == threshold:
+            return "Remboursé"
+        won = actual > threshold if total.group(1) == "+" else actual < threshold
+        return "Gagné" if won else "Perdu"
+    return ""
+
+
+def update_sheet_results(api_key: str) -> int:
+    worksheet = open_google_worksheet()
+    values = worksheet.get_all_values()
+    if not values:
+        print("Google Sheets ne contient aucune ligne à mettre à jour.")
+        return 0
+    header = values[0]
+    columns = {normalized(name): index for index, name in enumerate(header)}
+    required = (
+        "discipline", "competition", "match", "prono", "statut global",
+        "resultat", "score",
+    )
+    if any(name not in columns for name in required):
+        raise RuntimeError("Colonnes requises pour la mise à jour des résultats introuvables.")
+    indexes = {
+        "Date": columns.get("date", -1),
+        "Type de Case": columns.get("type de case", -1),
+        "Statut global": columns["statut global"],
+        "Discipline": columns["discipline"],
+        "Compétition": columns["competition"],
+        "Match": columns["match"],
+        "Prono": columns["prono"],
+        "Résultat": columns["resultat"],
+        "Score": columns["score"],
+    }
+
+    def cell(row: list[str], name: str) -> str:
+        index = indexes[name]
+        return row[index].strip() if index >= 0 and index < len(row) else ""
+
+    eligible_sports: set[str] = set()
+    for row in values[1:]:
+        status = normalized(cell(row, "Statut global"))
+        if not cell(row, "Résultat") and status in {"a venir", "en cours", "perdu"}:
+            sport_key = SPORT_BY_COMPETITION.get(cell(row, "Compétition").casefold())
+            if sport_key:
+                eligible_sports.add(sport_key)
+
+    results: dict[str, list[dict[str, Any]]] = {}
+    for sport_key in sorted(eligible_sports):
+        payload, _ = api_get(
+            f"/sports/{sport_key}/scores",
+            {"daysFrom": "2", "dateFormat": "iso"},
+            api_key,
+        )
+        if not isinstance(payload, list):
+            raise RuntimeError(f"Réponse inattendue de l’API pour {sport_key}/scores.")
+        results[sport_key] = [event for event in payload if isinstance(event, dict)]
+
+    changed = 0
+    panel_rows: dict[tuple[str, str], list[list[str]]] = {}
+    for row in values[1:]:
+        if indexes["Date"] >= 0 and indexes["Type de Case"] >= 0:
+            panel_rows.setdefault((cell(row, "Date"), cell(row, "Type de Case")), []).append(row)
+        if cell(row, "Résultat"):
+            continue
+        sport_key = SPORT_BY_COMPETITION.get(cell(row, "Compétition").casefold())
+        if not sport_key:
+            continue
+        event = next(
+            (
+                item for item in results.get(sport_key, [])
+                if normalized(item.get("home_team")) == normalized(cell(row, "Match").split(" - ", 1)[0])
+                and normalized(item.get("away_team")) == normalized(cell(row, "Match").split(" - ", 1)[-1])
+            ),
+            None,
+        )
+        if event is None:
+            continue
+        teams = completed_score(
+            event,
+            str(event.get("home_team", "")),
+            str(event.get("away_team", "")),
+        )
+        if teams is None:
+            continue
+        score = f"{teams[0]} - {teams[1]}"
+        result = evaluate_pick(cell(row, "Prono"), *teams)
+        if not result:
+            continue
+        row[indexes["Score"]] = score
+        row[indexes["Résultat"]] = result
+        changed += 1
+
+    for panel in panel_rows.values():
+        states = [cell(row, "Résultat") for row in panel]
+        global_status = (
+            "Perdu"
+            if any(normalized(state) == "perdu" for state in states)
+            else "Gagné"
+            if states and all(normalized(state) == "gagne" for state in states)
+            else "En cours"
+            if any(state for state in states)
+            else cell(panel[0], "Statut global")
+        )
+        for row in panel:
+            row[indexes["Statut global"]] = global_status
+
+    if changed:
+        padded_values = [
+            row[: len(SHEET_HEADERS)]
+            + [""] * max(0, len(SHEET_HEADERS) - len(row))
+            for row in values
+        ]
+        worksheet.update(
+            values=padded_values,
+            range_name=f"A1:L{len(values)}",
+            value_input_option="RAW",
+        )
+    print(f"Résultats Google Sheets mis à jour : {changed} match(s).")
+    return changed
 
 
 def main() -> int:
@@ -525,16 +823,34 @@ def main() -> int:
         action="store_true",
         help="affiche les panneaux sans modifier Google Sheets",
     )
+    parser.add_argument(
+        "--update-results",
+        action="store_true",
+        help="met à jour les scores/résultats des matchs déjà publiés",
+    )
     args = parser.parse_args()
 
     api_key = os.environ.get("ODDS_API_KEY")
+    if args.update_results:
+        if args.dry_run:
+            parser.error("--dry-run ne peut pas être combiné avec --update-results.")
+        if not api_key:
+            parser.error("la variable d’environnement ODDS_API_KEY est obligatoire.")
+        google_credentials_ready()
+        update_sheet_results(api_key)
+        return 0
     if not api_key:
         parser.error("la variable d’environnement ODDS_API_KEY est obligatoire.")
     if not args.dry_run:
         google_credentials_ready()
 
     now = datetime.now(timezone.utc)
-    start, end = now, now + timedelta(hours=24)
+    start = now
+    local_now = now.astimezone(TIMEZONE)
+    end_of_tomorrow = datetime.combine(
+        local_now.date() + timedelta(days=2), time.min, tzinfo=TIMEZONE
+    ).astimezone(timezone.utc) - timedelta(seconds=1)
+    end = min(now + timedelta(hours=48), end_of_tomorrow)
     events, remaining, odds_requests = fetch_events(api_key, start, end)
     selections = selections_from_events(events)
     panels = build_panels(selections)
@@ -542,7 +858,7 @@ def main() -> int:
     print(
         f"\n{len(events)} match(s) reçus dans la fenêtre "
         f"{start.astimezone(TIMEZONE):%Y-%m-%d %H:%M}–"
-        f"{end.astimezone(TIMEZONE):%Y-%m-%d %H:%M} (heure de Paris)."
+        f"{end.astimezone(TIMEZONE):%Y-%m-%d %H:%M} (heure du Cameroun)."
     )
     print(
         f"Crédits Odds API estimés pour les cotes : "
@@ -555,7 +871,14 @@ def main() -> int:
     if args.dry_run:
         print("\nMode dry-run : Google Sheets n’a pas été modifié.")
     else:
-        write_google_sheet(panels_to_sheet_rows(panels))
+        if sum(len(panel.selections) for panel in panels) != 12 or any(
+            len(panel.selections) != 4 for panel in panels
+        ):
+            raise RuntimeError(
+                "12 sélections uniques (4 par panneau) ne sont pas disponibles ; "
+                "Google Sheets n’a pas été modifié."
+            )
+        write_google_sheet(panels_to_sheet_rows(panels), now)
     return 0
 
 

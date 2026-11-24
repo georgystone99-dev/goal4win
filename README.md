@@ -30,16 +30,17 @@ Puis ouvrez `http://localhost:8000`.
 
 ## Générer les pronostics
 
-Le script `generate_pronos.py` récupère les cotes `h2h` et `totals` de The Odds API pour les matchs des prochaines 24 heures. Il calcule les probabilités corrigées de la marge, filtre les cotes strictement entre 1,20 et 1,50 et répartit les matchs uniques dans PRONOS 1, 2 et 3.
+Le script `generate_pronos.py` récupère les cotes `h2h` et `totals` de The Odds API pour les matchs à venir aujourd'hui et demain, dans la limite de 48 heures. Il couvre les principaux championnats européens, l'NBA et l'EuroLeague, calcule les probabilités corrigées de la marge, filtre les cotes entre 1,20 et 1,50 inclus et répartit 12 matchs uniques (4 par panneau). Un pari basketball n'est retenu que si sa probabilité corrigée dépasse 75 % et que les bookmakers sont suffisamment convergents.
 
 1. Installez les dépendances : `python -m pip install -r requirements.txt`.
 2. Définissez `ODDS_API_KEY` avec votre clé The Odds API.
 3. Pour prévisualiser sans modifier la feuille : `python generate_pronos.py --dry-run`.
 4. Pour publier, configurez un compte de service Google Sheets avec accès éditeur à la feuille. Fournissez le JSON du compte dans `GOOGLE_CREDENTIALS_JSON` ou placez-le dans `credentials.json` à la racine, puis lancez `python generate_pronos.py`.
+5. Pour actualiser les scores et résultats des rencontres en attente : `python generate_pronos.py --update-results`.
 
-Le script utilise par défaut la feuille déjà lue par la PWA et son premier onglet. `GOOGLE_SHEET_ID` et `GOOGLE_SHEET_NAME` permettent de changer de feuille ou d’onglet. Les identifiants Google ne doivent jamais être publiés. Les matchs retenus sont datés selon le fuseau `Europe/Paris` et écrits avec les colonnes attendues par `app.js` ; les lignes anciennes de la plage de données sont remplacées.
+Le script utilise par défaut la feuille déjà lue par la PWA et son premier onglet. `GOOGLE_SHEET_ID` et `GOOGLE_SHEET_NAME` permettent de changer de feuille ou d’onglet. Les identifiants Google ne doivent jamais être publiés. Les matchs retenus sont datés selon le fuseau `Africa/Douala` et écrits avec les colonnes attendues par `app.js`. Les lignes des 10 derniers jours sont conservées ; les seules lignes purgées sont celles plus anciennes que J−10. Les rencontres futures déjà présentes ne sont pas dupliquées et les panneaux verrouillés/en cours ne sont pas modifiés.
 
-Les appels au point de terminaison des événements servent d’abord à ignorer les championnats sans match dans la fenêtre et ne consomment pas de crédits de cotes. La récupération des cotes ne demande qu’une région (`eu`) et deux marchés. Le quota restant renvoyé par l’API est affiché lorsqu’il est disponible ; surveillez-le avant d’automatiser des exécutions fréquentes.
+Le workflow GitHub Actions met à jour les résultats chaque jour à 00h00 UTC, puis actualise les résultats et génère les nouveaux pronostics à 06h30 UTC. Les appels au point de terminaison des événements servent d’abord à ignorer les championnats sans match dans la fenêtre et ne consomment pas de crédits de cotes. La récupération des cotes ne demande qu’une région (`eu`) et deux marchés. Le quota restant renvoyé par l’API est affiché lorsqu’il est disponible ; surveillez-le avant d’automatiser des exécutions fréquentes.
 
 ## Important avant une mise en production
 
