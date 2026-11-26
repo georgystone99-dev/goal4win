@@ -1,6 +1,6 @@
 from contextlib import redirect_stdout
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from io import BytesIO, StringIO
 import unittest
 from urllib.error import HTTPError
@@ -9,18 +9,25 @@ from unittest.mock import call, MagicMock, patch
 from generate_pronos import (
     Panel,
     Selection,
+    StatisticalPick,
     SHEET_HEADERS,
     api_get,
     active_sports,
+    analyze_match,
     build_panels,
     build_daily_panels,
     date_is_complete,
+    event_match_score,
     evaluate_pick,
     fetch_daily_panels,
+    main,
     merge_sheet_rows,
     panels_to_sheet_rows,
     quote_candidates,
+    selected_market_quote,
+    team_statistics,
     update_sheet_results,
+    verify_statistical_picks,
     write_google_sheet,
 )
 
@@ -158,6 +165,246 @@ class QuoteTests(unittest.TestCase):
         self.assertEqual(by_pick["Total +1,5"].odds, 1.20)
         self.assertEqual(by_pick["Total -3,5"].odds, 1.50)
 
+    def test_selected_quote_checks_only_requested_outcome_and_line(self):
+        pick = StatisticalPick(
+            event={},
+            sport_key="soccer_epl",
+            pick="Total -3,5",
+            market="alternate_totals",
+            outcome="under",
+            point=3.5,
+            confidence=0.8,
+        )
+        event = {
+            "home_team": "Home FC",
+            "away_team": "Away FC",
+            "bookmakers": [
+                {
+                    "markets": [
+                        {
+                            "key": "alternate_totals",
+                            "outcomes": [
+                                {"name": "Under", "point": 2.5, "price": 1.25},
+                                {"name": "Under", "point": 3.5, "price": 1.20},
+                                {"name": "Over", "point": 3.5, "price": 1.50},
+                            ],
+                        }
+                    ]
+                }
+            ],
+        }
+
+        self.assertEqual(selected_market_quote(event, pick), (1.20, 1))
+
+    def test_selected_quote_derives_double_chance_from_h2h(self):
+        pick = StatisticalPick(
+            event={},
+            sport_key="soccer_epl",
+            pick="Double Chance 1X",
+            market="double_chance",
+            outcome="home_or_draw",
+            point=None,
+            confidence=0.8,
+        )
+        event = {
+            "home_team": "Home FC",
+            "away_team": "Away FC",
+            "bookmakers": [
+                {
+                    "markets": [
+                        {
+                            "key": "h2h",
+                            "outcomes": [
+                                {"name": "Home FC", "price": 1.25},
+                                {"name": "Draw", "price": 5.0},
+                                {"name": "Away FC", "price": 4.0},
+                            ],
+                        }
+                    ]
+                }
+            ],
+        }
+
+        quote = selected_market_quote(event, pick)
+
+        self.assertIsNotNone(quote)
+        self.assertGreaterEqual(quote[0], 1.20)
+        self.assertLessEqual(quote[0], 1.50)
+        self.assertEqual(quote[1], 1)
+
+
+class StatisticalAnalysisTests(unittest.TestCase):
+    def test_dry_run_without_statistics_key_exits_without_api_requests(self):
+        with patch.dict("os.environ", {}, clear=True), patch(
+            "sys.argv", ["generate_pronos.py", "--dry-run"]
+        ), patch("generate_pronos.football_data_get") as statistics_api, patch(
+            "generate_pronos.api_get"
+        ) as odds_api:
+            result = main()
+
+        self.assertEqual(result, 0)
+        statistics_api.assert_not_called()
+        odds_api.assert_not_called()
+
+    def test_uses_the_five_most_recent_results_for_team_form(self):
+        standings = {
+            "standings": [
+                {
+                    "type": "TOTAL",
+                    "table": [
+                        {
+                            "position": 1,
+                            "points": 30,
+                            "team": {"id": 10},
+                        }
+                    ],
+                }
+            ]
+        }
+        matches = []
+        for day in range(1, 7):
+            matches.append(
+                {
+                    "utcDate": f"2026-11-{day:02d}T12:00:00Z",
+                    "homeTeam": {"id": 10},
+                    "awayTeam": {"id": 20},
+                    "score": {
+                        "fullTime": {
+                            "home": 2 if day >= 2 else 0,
+                            "away": 0 if day >= 2 else 1,
+                        }
+                    },
+                }
+            )
+
+        stats = team_statistics(standings, matches)[10]
+
+        self.assertEqual((stats.wins, stats.draws, stats.losses), (5, 0, 0))
+        self.assertEqual((stats.goals_for, stats.goals_against), (2, 0))
+
+    def test_analyzes_fixture_into_one_of_the_supported_markets(self):
+        from generate_pronos import TeamStats
+
+        home = TeamStats(1, 1, 30, 2.2, 0.6, 4, 1, 0)
+        away = TeamStats(2, 16, 10, 0.6, 2.0, 1, 1, 3)
+        fixture = {
+            "homeTeam": {"name": "Home FC"},
+            "awayTeam": {"name": "Away FC"},
+        }
+
+        pick = analyze_match(fixture, "soccer_epl", home, away, 20)
+
+        self.assertIn(
+            (pick.pick, pick.market),
+            {
+                ("Total +1,5", "alternate_totals"),
+                ("Total +2,5", "totals"),
+                ("Total -3,5", "alternate_totals"),
+                ("Vainqueur 1", "h2h"),
+                ("Vainqueur 2", "h2h"),
+                ("Double Chance 1X", "double_chance"),
+                ("Double Chance X2", "double_chance"),
+                ("Double Chance 12", "double_chance"),
+            },
+        )
+        self.assertGreaterEqual(pick.confidence, 0)
+        self.assertLessEqual(pick.confidence, 1)
+
+    def test_soft_event_matching_checks_team_names_and_kickoff_time(self):
+        pick = StatisticalPick(
+            event={
+                "utcDate": "2026-11-26T17:00:00Z",
+                "homeTeam": {"name": "Manchester United FC"},
+                "awayTeam": {"name": "Chelsea FC"},
+            },
+            sport_key="soccer_epl",
+            pick="Vainqueur 1",
+            market="h2h",
+            outcome="home",
+            point=None,
+            confidence=0.8,
+        )
+
+        score = event_match_score(
+            pick,
+            {
+                "home_team": "Manchester United",
+                "away_team": "Chelsea",
+                "commence_time": "2026-11-26T17:30:00Z",
+            },
+        )
+
+        self.assertIsNotNone(score)
+
+    def test_verifies_only_the_five_top_matches_with_one_market_each(self):
+        day = date(2026, 11, 26)
+        picks = [
+            StatisticalPick(
+                event={
+                    "utcDate": f"2026-11-26T17:{index:02d}:00Z",
+                    "homeTeam": {"name": f"Home {index}"},
+                    "awayTeam": {"name": f"Away {index}"},
+                },
+                sport_key="soccer_epl",
+                pick="Vainqueur 1",
+                market="h2h",
+                outcome="home",
+                point=None,
+                confidence=0.9 - index * 0.01,
+            )
+            for index in range(6)
+        ]
+        events = [
+            {
+                "id": f"odds-{index}",
+                "home_team": f"Home {index}",
+                "away_team": f"Away {index}",
+                "commence_time": f"2026-11-26T17:{index:02d}:00Z",
+            }
+            for index in range(6)
+        ]
+
+        def fake_api_get(path, params, api_key):
+            if path.endswith("/events"):
+                return events, {}
+            event_id = path.rsplit("/", 2)[-2]
+            event = next(event for event in events if event["id"] == event_id)
+            return {
+                **event,
+                "bookmakers": [
+                    {
+                        "markets": [
+                            {
+                                "key": "h2h",
+                                "outcomes": [
+                                    {"name": event["home_team"], "price": 1.30}
+                                ],
+                            }
+                        ]
+                    }
+                ],
+            }, {}
+
+        with patch("generate_pronos.api_get", side_effect=fake_api_get) as api_get:
+            selections, _, odds_requests = verify_statistical_picks(
+                "odds-key",
+                picks,
+                [day],
+                datetime(2026, 11, 25, 12, tzinfo=timezone.utc),
+                {"soccer_epl": ("Football", "Premier League")},
+            )
+
+        odds_calls = [
+            call for call in api_get.call_args_list
+            if "/odds" in call.args[0]
+        ]
+        self.assertEqual(len(selections[day]), 5)
+        self.assertEqual(odds_requests, 5)
+        self.assertEqual(len(odds_calls), 5)
+        self.assertTrue(
+            all(call.args[1]["markets"] == "h2h" for call in odds_calls)
+        )
+
 
 class ResultTests(unittest.TestCase):
     def test_evaluates_winners_double_chance_and_totals(self):
@@ -225,6 +472,37 @@ class ResultTests(unittest.TestCase):
         )
         self.assertEqual(worksheet.values[1][10:12], ["Gagné", "2 - 1"])
         self.assertEqual(worksheet.values[1][2], "Gagné")
+
+    def test_publishes_a_valid_partial_day(self):
+        class FakeWorksheet:
+            title = "Matchs"
+
+            def __init__(self):
+                self.values = []
+
+            def get_all_values(self):
+                return self.values
+
+            def update(self, values, range_name, value_input_option):
+                self.values = values
+
+        worksheet = FakeWorksheet()
+        rows = [
+            list(SHEET_HEADERS),
+            [
+                "2026-11-24", "1", "À venir", "Football",
+                "Premier League", "Home FC - Away FC", "Double Chance 1X",
+                "1,35", "17:00", "1,35", "", "",
+            ],
+        ]
+
+        write_google_sheet(
+            rows,
+            datetime(2026, 11, 24, 8, tzinfo=timezone.utc),
+            worksheet,
+        )
+
+        self.assertEqual(len(worksheet.values), 2)
 
 
 class PanelTests(unittest.TestCase):

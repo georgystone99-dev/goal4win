@@ -30,17 +30,19 @@ Puis ouvrez `http://localhost:8000`.
 
 ## Générer les pronostics
 
-Le script `generate_pronos.py` génère séparément les pronostics d'aujourd'hui (J), demain (J+1) et après-demain (J+2). Il vérifie d'abord l'onglet `Matchs` et ne demande pas de nouvelles cotes pour une date qui contient déjà 12 matchs uniques (4 par panneau). Pour chaque date manquante ou incomplète, il cherche 12 matchs uniques et fiables, répartis en 3 panneaux de 4. Les cotes sont comprises entre 1,20 et 1,50 inclus ; un panneau peut inclure 3 matchs de football et 1 de basketball uniquement si la probabilité corrigée du match de basketball dépasse 75 % et sa cote est au plus 1,32. Les compétitions actives sont découvertes par l'endpoint gratuit `/v4/sports`, puis interrogées par priorité ; les demandes payantes cessent dès que la journée a ses 12 pronostics. Les lignes de J−10 à J+2 sont conservées et seules celles antérieures à J−10 sont purgées.
+Le script `generate_pronos.py` analyse les matchs de J et J+1 avec les données gratuites de football-data.org : classement actuel et cinq derniers résultats de chaque équipe. Il attribue un score statistique au meilleur pari parmi Total +1,5, Total +2,5, Total -3,5, Vainqueur, Double Chance 1X/X2 et Double Chance 12, puis présélectionne au plus cinq matchs par jour.
+
+The Odds API n'est appelée qu'après cette présélection. L'endpoint gratuit des événements associe les rencontres par équipes et heure de début ; un seul marché de cotes, celui du pari retenu, est ensuite demandé par match. Seules les cotes de 1,20 à 1,50 inclus sont publiées, dans les panneaux `PRONOS 1`, `PRONOS 2` et `PRONOS 3` (jusqu'à cinq sélections par jour). Les lignes de J−10 à J+2 sont conservées et seules celles antérieures à J−10 sont purgées.
 
 1. Installez les dépendances : `python -m pip install -r requirements.txt`.
-2. Définissez `ODDS_API_KEY` avec votre clé The Odds API.
-3. Pour prévisualiser sans modifier la feuille : `python generate_pronos.py --dry-run`.
+2. Définissez `FOOTBALL_DATA_API_KEY` avec une clé football-data.org et `ODDS_API_KEY` avec votre clé The Odds API. Dans GitHub Actions, configurez-les comme secrets `FOOTBALL_DATA_API_KEY` et `ODDS_API_KEY`. Si la clé football-data.org manque, le script affiche une information et termine sans appeler les API ni modifier Sheets.
+3. Pour prévisualiser sans modifier la feuille : `python generate_pronos.py --dry-run`. Avec les deux clés configurées, le dry-run appelle les API et peut consommer des crédits de cotes pour les matchs présélectionnés.
 4. Pour publier, configurez un compte de service Google Sheets avec accès éditeur à la feuille. Fournissez le JSON du compte dans `GOOGLE_CREDENTIALS_JSON` ou placez-le dans `credentials.json` à la racine, puis lancez `python generate_pronos.py`.
 5. Pour actualiser les scores et résultats des rencontres en attente : `python generate_pronos.py --update-results`.
 
 Le script utilise par défaut la feuille déjà lue par la PWA et son premier onglet. `GOOGLE_SHEET_ID` et `GOOGLE_SHEET_NAME` permettent de changer de feuille ou d’onglet. Les identifiants Google ne doivent jamais être publiés. Les matchs retenus sont datés selon le fuseau `Africa/Douala` et écrits avec les colonnes attendues par `app.js`. Les lignes des 10 derniers jours sont conservées ; les seules lignes purgées sont celles plus anciennes que J−10. Les rencontres futures déjà présentes ne sont pas dupliquées et les panneaux verrouillés/en cours ne sont pas modifiés.
 
-Le workflow GitHub Actions met à jour les résultats chaque jour à 00h00 UTC, puis actualise les résultats et génère les nouveaux pronostics à 06h30 UTC. Les appels au point de terminaison des événements servent d'abord à ignorer les championnats sans match dans la journée et ne consomment pas de crédits de cotes. La récupération des cotes ne demande qu'une région (`eu`) et deux marchés. Chaque appel HTTP à The Odds API est précédé d'une pause de 1,2 seconde ; une réponse 429 `EXCEEDED_FREQ_LIMIT` déclenche une nouvelle tentative après 3 secondes. Le quota restant renvoyé par l'API est affiché lorsqu'il est disponible ; surveillez-le avant d'automatiser des exécutions fréquentes.
+Le workflow GitHub Actions met à jour les résultats chaque jour à 00h00 UTC, puis actualise les résultats et génère les nouveaux pronostics à 06h30 UTC. Les appels à l'API statistique sont espacés pour respecter sa limite de requêtes ; les événements The Odds API sont gratuits, tandis que chaque vérification de cote demande un seul marché dans la région `eu`.
 
 ## Important avant une mise en production
 

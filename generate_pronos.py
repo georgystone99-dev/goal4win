@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
+import math
 import os
 import re
 import statistics
@@ -17,11 +19,12 @@ from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 
 API_BASE = "https://api.the-odds-api.com/v4"
+FOOTBALL_DATA_API_BASE = "https://api.football-data.org/v4"
 TIMEZONE = ZoneInfo("Africa/Douala")
 MARKETS = ("h2h", "totals")
 API_REQUEST_DELAY = 1.2
@@ -104,11 +107,30 @@ ODDS_COMPETITION_PRIORITY = (
     "soccer_uefa_nations_league",
 )
 MAX_ODDS_REQUESTS_PER_RUN = 12
+MAX_STATISTICAL_PICKS_PER_DAY = 5
+TEAM_MATCH_HISTORY_LIMIT = 500
+FOOTBALL_DATA_MIN_REQUEST_INTERVAL = 6.1
+FOOTBALL_DATA_COMPETITIONS = {
+    "PL": "soccer_epl",
+    "PD": "soccer_spain_la_liga",
+    "BL1": "soccer_germany_bundesliga",
+    "SA": "soccer_italy_serie_a",
+    "FL1": "soccer_france_ligue_one",
+    "PPL": "soccer_portugal_primeira_liga",
+    "DED": "soccer_netherlands_eredivisie",
+    "BJL": "soccer_belgium_first_div",
+    "ELC": "soccer_efl_champ",
+    "CL": "soccer_uefa_champs_league",
+    "EL": "soccer_uefa_europa_league",
+    "EC": "soccer_uefa_european_championship",
+    "WC": "soccer_fifa_world_cup",
+}
 SPORT_BY_COMPETITION = {
     competition.casefold(): sport_key
     for sport_key, (_, competition) in SPORTS.items()
 }
 DEFAULT_SPREADSHEET_ID = "11t2NRQYociuLCvE-VzicXg282XxTXDctM7oychcH5cQ"
+_FOOTBALL_DATA_LAST_REQUEST_AT: float | None = None
 
 
 @dataclass(frozen=True)
@@ -134,6 +156,33 @@ class Selection:
         )
 
 
+@dataclass(frozen=True)
+class TeamStats:
+    team_id: int
+    position: int
+    points: int
+    goals_for: float
+    goals_against: float
+    wins: int
+    draws: int
+    losses: int
+
+    @property
+    def form_points(self) -> int:
+        return self.wins * 3 + self.draws
+
+
+@dataclass(frozen=True)
+class StatisticalPick:
+    event: dict[str, Any]
+    sport_key: str
+    pick: str
+    market: str
+    outcome: str
+    point: float | None
+    confidence: float
+
+
 @dataclass
 class Panel:
     number: int
@@ -157,6 +206,312 @@ def parse_datetime(value: str) -> datetime:
 def iso_utc(value: datetime) -> str:
     return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace(
         "+00:00", "Z"
+    )
+
+
+def football_data_get(
+    path: str, params: dict[str, str], api_key: str
+) -> Any:
+    global _FOOTBALL_DATA_LAST_REQUEST_AT
+    if _FOOTBALL_DATA_LAST_REQUEST_AT is not None:
+        elapsed = time.monotonic() - _FOOTBALL_DATA_LAST_REQUEST_AT
+        if elapsed < FOOTBALL_DATA_MIN_REQUEST_INTERVAL:
+            time.sleep(FOOTBALL_DATA_MIN_REQUEST_INTERVAL - elapsed)
+    _FOOTBALL_DATA_LAST_REQUEST_AT = time.monotonic()
+    query = urlencode(params)
+    request = Request(
+        f"{FOOTBALL_DATA_API_BASE}{path}?{query}" if query
+        else f"{FOOTBALL_DATA_API_BASE}{path}",
+        headers={"X-Auth-Token": api_key},
+    )
+    try:
+        with urlopen(request, timeout=30) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        message = exc.read().decode("utf-8", errors="replace").strip()
+        exc.close()
+        raise RuntimeError(
+            f"football-data.org a renvoyé HTTP {exc.code} pour {path}: "
+            f"{message or exc.reason}"
+        ) from exc
+    except URLError as exc:
+        raise RuntimeError(
+            f"Connexion à football-data.org impossible : {exc.reason}"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"Réponse JSON invalide de football-data.org ({path})."
+        ) from exc
+
+
+def team_statistics(
+    standings_payload: dict[str, Any],
+    finished_matches: list[dict[str, Any]],
+) -> dict[int, TeamStats]:
+    tables = standings_payload.get("standings", [])
+    table = next(
+        (
+            item.get("table", [])
+            for item in tables
+            if isinstance(item, dict) and item.get("type") == "TOTAL"
+        ),
+        [],
+    )
+    standings = {
+        int(row["team"]["id"]): row
+        for row in table
+        if isinstance(row, dict)
+        and isinstance(row.get("team"), dict)
+        and row["team"].get("id") is not None
+    }
+    matches_by_team: dict[int, list[dict[str, Any]]] = {}
+    for match in finished_matches:
+        if not isinstance(match, dict):
+            continue
+        score = match.get("score", {}).get("fullTime", {})
+        home_id = match.get("homeTeam", {}).get("id")
+        away_id = match.get("awayTeam", {}).get("id")
+        try:
+            home_goals, away_goals = int(score["home"]), int(score["away"])
+            played_at = parse_datetime(str(match["utcDate"]))
+            home_id, away_id = int(home_id), int(away_id)
+        except (KeyError, TypeError, ValueError):
+            continue
+        for team_id, goals_for, goals_against in (
+            (home_id, home_goals, away_goals),
+            (away_id, away_goals, home_goals),
+        ):
+            matches_by_team.setdefault(team_id, []).append(
+                {
+                    "utcDate": played_at,
+                    "goals_for": goals_for,
+                    "goals_against": goals_against,
+                }
+            )
+
+    result: dict[int, TeamStats] = {}
+    for team_id, row in standings.items():
+        recent = sorted(
+            matches_by_team.get(team_id, []),
+            key=lambda match: match["utcDate"],
+            reverse=True,
+        )[:5]
+        if len(recent) < 5:
+            continue
+        wins = sum(match["goals_for"] > match["goals_against"] for match in recent)
+        draws = sum(match["goals_for"] == match["goals_against"] for match in recent)
+        result[team_id] = TeamStats(
+            team_id=team_id,
+            position=int(row["position"]),
+            points=int(row["points"]),
+            goals_for=statistics.mean(match["goals_for"] for match in recent),
+            goals_against=statistics.mean(match["goals_against"] for match in recent),
+            wins=wins,
+            draws=draws,
+            losses=5 - wins - draws,
+        )
+    return result
+
+
+def _poisson_probabilities(expected_goals: float, limit: int = 12) -> list[float]:
+    probabilities = [math.exp(-expected_goals)]
+    for goals in range(1, limit + 1):
+        probabilities.append(probabilities[-1] * expected_goals / goals)
+    return probabilities
+
+
+def analyze_match(
+    event: dict[str, Any],
+    sport_key: str,
+    home_stats: TeamStats,
+    away_stats: TeamStats,
+    league_size: int,
+) -> StatisticalPick:
+    home_advantage = max(
+        -1.0,
+        min(
+            1.0,
+            (away_stats.position - home_stats.position) / max(league_size / 2, 1)
+            + (home_stats.form_points - away_stats.form_points) / 15,
+        ),
+    )
+    home_expected = (
+        (home_stats.goals_for + away_stats.goals_against) / 2
+    ) * math.exp(0.12 * home_advantage)
+    away_expected = (
+        (away_stats.goals_for + home_stats.goals_against) / 2
+    ) * math.exp(-0.12 * home_advantage)
+    home_goals = _poisson_probabilities(max(home_expected, 0.05))
+    away_goals = _poisson_probabilities(max(away_expected, 0.05))
+    outcomes = {
+        "home": 0.0,
+        "draw": 0.0,
+        "away": 0.0,
+        "over_1_5": 0.0,
+        "over_2_5": 0.0,
+        "under_3_5": 0.0,
+    }
+    for home_score, home_probability in enumerate(home_goals):
+        for away_score, away_probability in enumerate(away_goals):
+            probability = home_probability * away_probability
+            total = home_score + away_score
+            if home_score > away_score:
+                outcomes["home"] += probability
+            elif home_score == away_score:
+                outcomes["draw"] += probability
+            else:
+                outcomes["away"] += probability
+            if total > 1:
+                outcomes["over_1_5"] += probability
+            if total > 2:
+                outcomes["over_2_5"] += probability
+            if total < 4:
+                outcomes["under_3_5"] += probability
+
+    choices = [
+        ("Total +1,5", "alternate_totals", "over", 1.5, outcomes["over_1_5"]),
+        ("Total +2,5", "totals", "over", 2.5, outcomes["over_2_5"]),
+        ("Total -3,5", "alternate_totals", "under", 3.5, outcomes["under_3_5"]),
+        ("Vainqueur 1", "h2h", "home", None, outcomes["home"]),
+        ("Vainqueur 2", "h2h", "away", None, outcomes["away"]),
+        (
+            "Double Chance 1X",
+            "double_chance",
+            "home_or_draw",
+            None,
+            outcomes["home"] + outcomes["draw"],
+        ),
+        (
+            "Double Chance X2",
+            "double_chance",
+            "draw_or_away",
+            None,
+            outcomes["draw"] + outcomes["away"],
+        ),
+        (
+            "Double Chance 12",
+            "double_chance",
+            "home_or_away",
+            None,
+            outcomes["home"] + outcomes["away"],
+        ),
+    ]
+    pick, market, outcome, point, confidence = max(choices, key=lambda item: item[4])
+    return StatisticalPick(
+        event=event,
+        sport_key=sport_key,
+        pick=pick,
+        market=market,
+        outcome=outcome,
+        point=point,
+        confidence=confidence,
+    )
+
+
+def fetch_statistical_picks(
+    api_key: str,
+    target_dates: list[date],
+    now: datetime,
+) -> list[StatisticalPick]:
+    if not target_dates:
+        return []
+    start, _ = date_window(target_dates[0], now)
+    _, final_day = date_window(target_dates[-1], now)
+    fixtures_payload = football_data_get(
+        "/matches",
+        {
+            "dateFrom": start.date().isoformat(),
+            "dateTo": final_day.date().isoformat(),
+        },
+        api_key,
+    )
+    if not isinstance(fixtures_payload, dict) or not isinstance(
+        fixtures_payload.get("matches"), list
+    ):
+        raise RuntimeError(
+            "Réponse inattendue de l’API football-data.org pour /matches."
+        )
+    fixtures = fixtures_payload["matches"]
+    by_competition: dict[str, list[dict[str, Any]]] = {}
+    for fixture in fixtures:
+        if not isinstance(fixture, dict):
+            continue
+        competition = fixture.get("competition")
+        if not isinstance(competition, dict):
+            continue
+        competition_code = str(competition.get("code", ""))
+        if competition_code in FOOTBALL_DATA_COMPETITIONS:
+            by_competition.setdefault(competition_code, []).append(fixture)
+
+    picks: list[StatisticalPick] = []
+    history_end = now.astimezone(TIMEZONE).date().isoformat()
+    for competition_code, competition_fixtures in by_competition.items():
+        competition_key = FOOTBALL_DATA_COMPETITIONS[competition_code]
+        season_starts = [
+            str(fixture["season"].get("startDate", ""))
+            for fixture in competition_fixtures
+            if isinstance(fixture.get("season"), dict)
+            and fixture["season"].get("startDate")
+        ]
+        history_start = min(season_starts) if season_starts else (
+            now.astimezone(TIMEZONE).date() - timedelta(days=120)
+        ).isoformat()
+        standings = football_data_get(
+            f"/competitions/{competition_code}/standings", {}, api_key
+        )
+        if not isinstance(standings, dict):
+            raise RuntimeError(
+                f"Réponse inattendue de l’API football-data.org pour "
+                f"{competition_code}/standings."
+            )
+        history = football_data_get(
+            f"/competitions/{competition_code}/matches",
+            {
+                "dateFrom": history_start,
+                "dateTo": history_end,
+                "status": "FINISHED",
+                "limit": str(TEAM_MATCH_HISTORY_LIMIT),
+            },
+            api_key,
+        )
+        if not isinstance(history, dict) or not isinstance(
+            history.get("matches"), list
+        ):
+            raise RuntimeError(
+                f"Réponse inattendue de l’API football-data.org pour "
+                f"{competition_code}/matches."
+            )
+        stats = team_statistics(standings, history["matches"])
+        league_size = max(len(stats), 2)
+        for fixture in competition_fixtures:
+            try:
+                match_time = parse_datetime(str(fixture["utcDate"]))
+                local_date = match_time.astimezone(TIMEZONE).date()
+                home_id = int(fixture["homeTeam"]["id"])
+                away_id = int(fixture["awayTeam"]["id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if (
+                local_date not in target_dates
+                or home_id not in stats
+                or away_id not in stats
+            ):
+                continue
+            picks.append(
+                analyze_match(
+                    fixture,
+                    competition_key,
+                    stats[home_id],
+                    stats[away_id],
+                    league_size,
+                )
+            )
+    return sorted(
+        picks,
+        key=lambda pick: (
+            -pick.confidence,
+            str(pick.event.get("utcDate", "")),
+        ),
     )
 
 
@@ -581,6 +936,288 @@ def selections_from_events(
         best_by_fixture.values(),
         key=lambda selection: (-selection.probability, selection.commence_time),
     )
+
+
+def _team_match_score(first: str, second: str) -> float:
+    def cleaned(value: str) -> str:
+        words = re.sub(r"[^a-z0-9]+", " ", normalized(value)).split()
+        while words and words[-1] in {"fc", "cf", "sc", "afc", "club"}:
+            words.pop()
+        return " ".join(words)
+
+    left, right = cleaned(first), cleaned(second)
+    if not left or not right:
+        return 0.0
+    if left == right:
+        return 1.0
+    left_words, right_words = set(left.split()), set(right.split())
+    overlap = len(left_words & right_words) / max(len(left_words), len(right_words))
+    return max(overlap, difflib.SequenceMatcher(None, left, right).ratio())
+
+
+def event_match_score(
+    pick: StatisticalPick, odds_event: dict[str, Any]
+) -> float | None:
+    fixture = pick.event
+    home = str(fixture.get("homeTeam", {}).get("name", ""))
+    away = str(fixture.get("awayTeam", {}).get("name", ""))
+    if _team_match_score(home, str(odds_event.get("home_team", ""))) < 0.65:
+        return None
+    if _team_match_score(away, str(odds_event.get("away_team", ""))) < 0.65:
+        return None
+    try:
+        fixture_time = parse_datetime(str(fixture["utcDate"]))
+        odds_time = parse_datetime(str(odds_event["commence_time"]))
+    except (KeyError, ValueError):
+        return None
+    if abs(fixture_time - odds_time) > timedelta(hours=2):
+        return None
+    return (
+        _team_match_score(home, str(odds_event.get("home_team", "")))
+        + _team_match_score(away, str(odds_event.get("away_team", "")))
+        - abs(fixture_time - odds_time).total_seconds() / 7200
+    )
+
+
+def _odds_outcome_key(name: str) -> str:
+    key = re.sub(r"[^a-z0-9]+", " ", normalized(name)).strip()
+    aliases = {
+        "1x": "home_or_draw",
+        "home draw": "home_or_draw",
+        "home or draw": "home_or_draw",
+        "x2": "draw_or_away",
+        "draw away": "draw_or_away",
+        "draw or away": "draw_or_away",
+        "12": "home_or_away",
+        "home away": "home_or_away",
+        "home or away": "home_or_away",
+        "over": "over",
+        "under": "under",
+    }
+    return aliases.get(key, key)
+
+
+def selected_market_quote(
+    odds_event: dict[str, Any], pick: StatisticalPick
+) -> tuple[float, int] | None:
+    prices: list[float] = []
+    home_name = normalized(odds_event.get("home_team", ""))
+    away_name = normalized(odds_event.get("away_team", ""))
+
+    if pick.market == "double_chance":
+        for bookmaker in odds_event.get("bookmakers", []):
+            h2h_outcomes: dict[str, float] = {}
+            for market in bookmaker.get("markets", []):
+                if market.get("key") != "h2h":
+                    continue
+                for outcome in market.get("outcomes", []):
+                    name = normalized(outcome.get("name", ""))
+                    try:
+                        price = float(outcome["price"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if name == home_name:
+                        h2h_outcomes["home"] = price
+                    elif name == away_name:
+                        h2h_outcomes["away"] = price
+                    elif name in {"draw", "tie", "x"}:
+                        h2h_outcomes["draw"] = price
+            if not {"home", "draw", "away"}.issubset(h2h_outcomes):
+                continue
+            reciprocal_sum = sum(
+                1 / h2h_outcomes[key] for key in ("home", "draw", "away")
+                if h2h_outcomes[key] > 0
+            )
+            if reciprocal_sum <= 0:
+                continue
+            if pick.outcome == "home_or_draw":
+                fair_probability = (
+                    1 / h2h_outcomes["home"] + 1 / h2h_outcomes["draw"]
+                ) / reciprocal_sum
+            elif pick.outcome == "draw_or_away":
+                fair_probability = (
+                    1 / h2h_outcomes["draw"] + 1 / h2h_outcomes["away"]
+                ) / reciprocal_sum
+            elif pick.outcome == "home_or_away":
+                fair_probability = (
+                    1 / h2h_outcomes["home"] + 1 / h2h_outcomes["away"]
+                ) / reciprocal_sum
+            else:
+                continue
+            if fair_probability <= 0:
+                continue
+            double_chance_odds = 1 / fair_probability
+            if MIN_ODDS <= double_chance_odds <= MAX_ODDS:
+                prices.append(double_chance_odds)
+        if not prices:
+            return None
+        return statistics.mean(prices), len(prices)
+
+    for bookmaker in odds_event.get("bookmakers", []):
+        for market in bookmaker.get("markets", []):
+            if market.get("key") != pick.market:
+                continue
+            outcomes = market.get("outcomes", [])
+            for outcome in outcomes:
+                name = str(outcome.get("name", ""))
+                outcome_key = _odds_outcome_key(name)
+                normalized_name = normalized(name)
+                if normalized_name == home_name:
+                    outcome_key = "home"
+                elif normalized_name == away_name:
+                    outcome_key = "away"
+                elif normalized_name in {"draw", "tie"}:
+                    outcome_key = "draw"
+                if outcome_key != pick.outcome:
+                    continue
+                if pick.point is not None:
+                    try:
+                        if float(outcome.get("point")) != pick.point:
+                            continue
+                    except (TypeError, ValueError):
+                        continue
+                try:
+                    price = float(outcome["price"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if MIN_ODDS <= price <= MAX_ODDS:
+                    prices.append(price)
+    if not prices:
+        return None
+    return statistics.mean(prices), len(prices)
+
+
+def verify_statistical_picks(
+    api_key: str,
+    picks: list[StatisticalPick],
+    target_dates: list[date],
+    now: datetime,
+    sports: dict[str, tuple[str, str]],
+) -> tuple[dict[date, list[Selection]], list[str], int]:
+    ranked: dict[date, list[StatisticalPick]] = {}
+    for pick in picks:
+        try:
+            local_date = parse_datetime(str(pick.event["utcDate"])).astimezone(
+                TIMEZONE
+            ).date()
+        except (KeyError, ValueError):
+            continue
+        if local_date in target_dates:
+            ranked.setdefault(local_date, []).append(pick)
+    shortlist = {
+        match_date: sorted(
+            day_picks,
+            key=lambda item: (-item.confidence, str(item.event.get("utcDate", ""))),
+        )[:MAX_STATISTICAL_PICKS_PER_DAY]
+        for match_date, day_picks in ranked.items()
+    }
+    selected_picks = [
+        pick for match_date in target_dates for pick in shortlist.get(match_date, [])
+    ]
+    events_by_sport: dict[str, list[dict[str, Any]]] = {}
+    remaining: list[str] = []
+    if selected_picks:
+        start, _ = date_window(target_dates[0], now)
+        _, end = date_window(target_dates[-1], now)
+        for sport_key in dict.fromkeys(pick.sport_key for pick in selected_picks):
+            payload, _ = api_get(
+                f"/sports/{sport_key}/events",
+                {
+                    "dateFormat": "iso",
+                    "commenceTimeFrom": iso_utc(start),
+                    "commenceTimeTo": iso_utc(end),
+                },
+                api_key,
+            )
+            if not isinstance(payload, list):
+                raise RuntimeError(
+                    f"Réponse inattendue de l’API pour {sport_key}/events."
+                )
+            events_by_sport[sport_key] = [
+                event for event in payload if isinstance(event, dict)
+            ]
+
+    selections_by_date: dict[date, list[Selection]] = {}
+    odds_requests = 0
+    used_event_ids: set[str] = set()
+    for match_date in target_dates:
+        for pick in shortlist.get(match_date, []):
+            matches = [
+                (event_match_score(pick, event), event)
+                for event in events_by_sport.get(pick.sport_key, [])
+            ]
+            matches = [
+                (score, event)
+                for score, event in matches
+                if score is not None and str(event.get("id", "")) not in used_event_ids
+            ]
+            if not matches:
+                print(
+                    f"Information : aucune correspondance The Odds API pour "
+                    f"{pick.event.get('homeTeam', {}).get('name', '?')} - "
+                    f"{pick.event.get('awayTeam', {}).get('name', '?')}."
+                )
+                continue
+            _, odds_event = max(matches, key=lambda item: item[0])
+            event_id = str(odds_event.get("id", ""))
+            if not event_id:
+                continue
+            used_event_ids.add(event_id)
+            odds_payload, headers = api_get(
+                f"/sports/{pick.sport_key}/events/{event_id}/odds",
+                {
+                    "regions": "eu",
+                    "markets": pick.market,
+                    "oddsFormat": "decimal",
+                },
+                api_key,
+            )
+            odds_requests += 1
+            if headers.get("x-requests-remaining") is not None:
+                remaining.append(headers["x-requests-remaining"])
+            if isinstance(odds_payload, list):
+                odds_event = next(
+                    (
+                        event for event in odds_payload
+                        if isinstance(event, dict)
+                    ),
+                    odds_event,
+                )
+            elif isinstance(odds_payload, dict):
+                odds_event = odds_payload
+            else:
+                raise RuntimeError(
+                    f"Réponse inattendue de l’API pour l’événement {event_id}."
+                )
+            quote = selected_market_quote(odds_event, pick)
+            if quote is None:
+                print(
+                    f"Information : {pick.pick} non coté entre "
+                    f"{MIN_ODDS:.2f} et {MAX_ODDS:.2f} pour "
+                    f"{odds_event.get('home_team', '?')} - "
+                    f"{odds_event.get('away_team', '?')}."
+                )
+                continue
+            odds, bookmaker_count = quote
+            commence_time = parse_datetime(str(odds_event["commence_time"]))
+            sport, competition = sports[pick.sport_key]
+            selections_by_date.setdefault(match_date, []).append(
+                Selection(
+                    event_id=event_id,
+                    home=str(odds_event.get("home_team", "")),
+                    away=str(odds_event.get("away_team", "")),
+                    sport=sport,
+                    competition=competition,
+                    commence_time=commence_time,
+                    pick=pick.pick,
+                    odds=odds,
+                    probability=pick.confidence,
+                    bookmaker_count=bookmaker_count,
+                    consensus_spread=0.0,
+                    market=pick.market,
+                )
+            )
+    return selections_by_date, remaining, odds_requests
 
 
 def average_probability(selections: list[Selection]) -> float:
@@ -1303,7 +1940,7 @@ def update_sheet_results(api_key: str) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Génère les panneaux Goal4win depuis The Odds API."
+        description="Présélectionne des matchs au moyen des statistiques puis vérifie leurs cotes."
     )
     parser.add_argument(
         "--dry-run",
@@ -1326,14 +1963,29 @@ def main() -> int:
         google_credentials_ready()
         update_sheet_results(api_key)
         return 0
+    statistics_key = os.environ.get("FOOTBALL_DATA_API_KEY")
+    if not statistics_key:
+        print(
+            "Information : FOOTBALL_DATA_API_KEY n’est pas configurée ; "
+            "aucune présélection statistique ni requête de cotes."
+        )
+        if args.dry_run:
+            print("\nMode dry-run : Google Sheets n’a pas été modifié.")
+        return 0
     if not api_key:
-        parser.error("la variable d’environnement ODDS_API_KEY est obligatoire.")
+        print(
+            "Information : ODDS_API_KEY n’est pas configurée ; "
+            "les matchs présélectionnés ne peuvent pas être vérifiés."
+        )
+        if args.dry_run:
+            print("\nMode dry-run : Google Sheets n’a pas été modifié.")
+        return 0
     if not args.dry_run:
         google_credentials_ready()
 
     now = datetime.now(timezone.utc)
     today = now.astimezone(TIMEZONE).date()
-    target_dates = [today + timedelta(days=offset) for offset in range(3)]
+    target_dates = [today, today + timedelta(days=1)]
     worksheet = None
     existing_rows: list[list[str]] = []
     if not args.dry_run:
@@ -1357,18 +2009,35 @@ def main() -> int:
     remaining: list[str] = []
     odds_requests = 0
     if missing_dates:
-        sports = active_sports(api_key)
-        panels_by_date, remaining, odds_requests = fetch_daily_panels(
-            api_key, missing_dates, now, sports, existing_rows
+        statistical_picks = fetch_statistical_picks(
+            statistics_key, missing_dates, now
         )
+        for match_date in missing_dates:
+            day_count = sum(
+                parse_datetime(str(pick.event["utcDate"])).astimezone(
+                    TIMEZONE
+                ).date() == match_date
+                for pick in statistical_picks
+            )
+            print(
+                f"{match_date.isoformat()} : {day_count} match(s) "
+                "analysé(s) statistiquement."
+            )
+        selections_by_date, remaining, odds_requests = verify_statistical_picks(
+            api_key, statistical_picks, missing_dates, now, SPORTS
+        )
+        for match_date, selections in selections_by_date.items():
+            panels_by_date[match_date] = build_daily_panels(
+                selections,
+                existing_by_date.get(match_date.isoformat(), {}),
+            )
 
     for match_date, panels in panels_by_date.items():
         print(f"\nPronostics du {match_date.isoformat()} (heure du Cameroun) :")
         display_panels(panels)
     print(
-        f"Crédits Odds API estimés pour les cotes : "
-        f"{odds_requests * len(MARKETS)} "
-        f"({odds_requests} requête(s) de cotes, région eu)."
+        f"Vérification des cotes : {odds_requests} requête(s) ciblée(s) "
+        "sur The Odds API (région eu ; événements gratuits)."
     )
     if remaining:
         print(f"Crédits restants selon l’API : {remaining[-1]}.")
@@ -1378,11 +2047,11 @@ def main() -> int:
         rows = [list(SHEET_HEADERS)]
         for panels in panels_by_date.values():
             rows.extend(panels_to_sheet_rows(panels)[1:])
-        write_google_sheet(rows, now, worksheet, list(panels_by_date))
+        write_google_sheet(rows, now, worksheet)
     elif missing_dates:
         print("\nAucun pronostic généré ; Google Sheets n’a pas été modifié.")
     else:
-        print("\nLes dates J, J+1 et J+2 sont déjà présentes ; aucune modification.")
+        print("\nLes dates J et J+1 sont déjà présentes ; aucune modification.")
     return 0
 
 
