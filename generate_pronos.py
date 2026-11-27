@@ -29,8 +29,8 @@ TIMEZONE = ZoneInfo("Africa/Douala")
 MARKETS = ("h2h", "totals")
 API_REQUEST_DELAY = 1.2
 API_RATE_LIMIT_RETRY_DELAY = 3
-MIN_ODDS = 1.20
-MAX_ODDS = 1.50
+MIN_ODDS = 1.15
+MAX_ODDS = 1.65
 MIN_BOOKMAKERS = 3
 MIN_BASKETBALL_PROBABILITY = 0.75
 MAX_CONSENSUS_SPREAD = 0.06
@@ -106,7 +106,15 @@ ODDS_COMPETITION_PRIORITY = (
     "soccer_fifa_world_cup",
     "soccer_uefa_nations_league",
 )
+FALLBACK_SPORT_KEYS = (
+    "soccer_uefa_europa_league",
+    "soccer_uefa_europa_conference_league",
+    "soccer_turkey_super_league",
+    "soccer_belgium_first_div",
+    "basketball_nba",
+)
 MAX_ODDS_REQUESTS_PER_RUN = 12
+MAX_FALLBACK_ODDS_REQUESTS_PER_RUN = 3
 MAX_STATISTICAL_PICKS_PER_DAY = 5
 TEAM_MATCH_HISTORY_LIMIT = 500
 FOOTBALL_DATA_MIN_REQUEST_INTERVAL = 6.1
@@ -515,7 +523,12 @@ def fetch_statistical_picks(
     )
 
 
-def api_get(path: str, params: dict[str, str], api_key: str) -> tuple[Any, dict[str, str]]:
+def api_get(
+    path: str,
+    params: dict[str, str],
+    api_key: str,
+    retry_rate_limit: bool = True,
+) -> tuple[Any, dict[str, str]]:
     query = urlencode({**params, "apiKey": api_key})
     request_url = f"{API_BASE}{path}?{query}"
     rate_limit_retry = False
@@ -532,6 +545,7 @@ def api_get(path: str, params: dict[str, str], api_key: str) -> tuple[Any, dict[
                 exc.code == 429
                 and "EXCEEDED_FREQ_LIMIT" in message
                 and not rate_limit_retry
+                and retry_rate_limit
             ):
                 rate_limit_retry = True
                 time.sleep(API_RATE_LIMIT_RETRY_DELAY)
@@ -1093,6 +1107,8 @@ def verify_statistical_picks(
     target_dates: list[date],
     now: datetime,
     sports: dict[str, tuple[str, str]],
+    max_odds_requests: int | None = None,
+    retry_rate_limit: bool = True,
 ) -> tuple[dict[date, list[Selection]], list[str], int]:
     ranked: dict[date, list[StatisticalPick]] = {}
     for pick in picks:
@@ -1142,6 +1158,15 @@ def verify_statistical_picks(
     used_event_ids: set[str] = set()
     for match_date in target_dates:
         for pick in shortlist.get(match_date, []):
+            if (
+                max_odds_requests is not None
+                and odds_requests >= max_odds_requests
+            ):
+                print(
+                    f"Information : plafond de {max_odds_requests} requêtes "
+                    "payantes atteint ; les vérifications restantes sont ignorées."
+                )
+                break
             matches = [
                 (event_match_score(pick, event), event)
                 for event in events_by_sport.get(pick.sport_key, [])
@@ -1171,6 +1196,7 @@ def verify_statistical_picks(
                     "oddsFormat": "decimal",
                 },
                 api_key,
+                retry_rate_limit=retry_rate_limit,
             )
             odds_requests += 1
             if headers.get("x-requests-remaining") is not None:
@@ -1220,6 +1246,134 @@ def verify_statistical_picks(
     return selections_by_date, remaining, odds_requests
 
 
+def fetch_fallback_selections(
+    api_key: str,
+    target_dates: list[date],
+    now: datetime,
+    max_odds_requests: int = MAX_FALLBACK_ODDS_REQUESTS_PER_RUN,
+) -> tuple[dict[date, list[Selection]], list[str], int]:
+    """Fetch free event lists and verify at most three matches using paid odds."""
+    odds_limit = max(
+        0, min(max_odds_requests, MAX_FALLBACK_ODDS_REQUESTS_PER_RUN)
+    )
+    sports = {
+        key: sport
+        for key, sport in active_sports(api_key).items()
+        if key in FALLBACK_SPORT_KEYS
+    }
+    if not sports:
+        print("Information : aucune compétition complémentaire n’est active.")
+        return {}, [], 0
+
+    events_by_date: dict[date, list[dict[str, Any]]] = {}
+    seen_event_ids: set[str] = set()
+    for match_date in target_dates:
+        start, end = date_window(match_date, now)
+        if end < start:
+            continue
+        params = {
+            "dateFormat": "iso",
+            "commenceTimeFrom": iso_utc(start),
+            "commenceTimeTo": iso_utc(end),
+        }
+        for sport_key in sports:
+            payload, _ = api_get(f"/sports/{sport_key}/events", params, api_key)
+            if not isinstance(payload, list):
+                raise RuntimeError(
+                    f"Réponse inattendue de l’API pour {sport_key}/events."
+                )
+            for event in payload:
+                if not isinstance(event, dict):
+                    continue
+                event_id = str(event.get("id", ""))
+                if not event_id or event_id in seen_event_ids:
+                    continue
+                if not is_in_window(event.get("commence_time"), start, end):
+                    continue
+                seen_event_ids.add(event_id)
+                events_by_date.setdefault(match_date, []).append(
+                    {**event, "sport_key": sport_key}
+                )
+
+    selected_events: list[tuple[date, dict[str, Any]]] = []
+    for match_date in target_dates:
+        day_events = sorted(
+            events_by_date.get(match_date, []),
+            key=lambda event: (
+                FALLBACK_SPORT_KEYS.index(event["sport_key"]),
+                str(event.get("commence_time", "")),
+            ),
+        )
+        if day_events and len(selected_events) < odds_limit:
+            selected_events.append((match_date, day_events.pop(0)))
+    remaining_events = sorted(
+        (
+            (match_date, event)
+            for match_date, day_events in events_by_date.items()
+            for event in day_events
+            if all(event["id"] != selected["id"] for _, selected in selected_events)
+        ),
+        key=lambda item: (
+            target_dates.index(item[0]),
+            FALLBACK_SPORT_KEYS.index(item[1]["sport_key"]),
+            str(item[1].get("commence_time", "")),
+        ),
+    )
+    selected_events.extend(
+        remaining_events[
+            : max(0, odds_limit - len(selected_events))
+        ]
+    )
+
+    selections_by_date: dict[date, list[Selection]] = {}
+    remaining_credits: list[str] = []
+    odds_requests = 0
+    for match_date, event in selected_events:
+        sport_key = str(event["sport_key"])
+        event_id = str(event["id"])
+        payload, headers = api_get(
+            f"/sports/{sport_key}/events/{event_id}/odds",
+            {"regions": "eu", "markets": "h2h", "oddsFormat": "decimal"},
+            api_key,
+            retry_rate_limit=False,
+        )
+        odds_requests += 1
+        if headers.get("x-requests-remaining") is not None:
+            remaining_credits.append(headers["x-requests-remaining"])
+        if isinstance(payload, list):
+            odds_event = next(
+                (item for item in payload if isinstance(item, dict)), None
+            )
+        elif isinstance(payload, dict):
+            odds_event = payload
+        else:
+            odds_event = None
+        if odds_event is None:
+            raise RuntimeError(
+                f"Réponse inattendue de l’API pour l’événement {event_id}."
+            )
+        odds_event = {**event, **odds_event, "sport_key": sport_key}
+        candidates = quote_candidates(odds_event, sport_key, sports)
+        if not candidates:
+            print(
+                f"Information : aucune cote admissible entre {MIN_ODDS:.2f} et "
+                f"{MAX_ODDS:.2f} pour {event.get('home_team', '?')} - "
+                f"{event.get('away_team', '?')}."
+            )
+            continue
+        selection = max(
+            candidates,
+            key=lambda item: (
+                item.probability,
+                item.strong_consensus,
+                item.bookmaker_count,
+                -item.odds,
+            ),
+        )
+        selections_by_date.setdefault(match_date, []).append(selection)
+    return selections_by_date, remaining_credits, odds_requests
+
+
 def average_probability(selections: list[Selection]) -> float:
     if not selections:
         return 0.0
@@ -1252,7 +1406,7 @@ def build_panels(selections: list[Selection]) -> list[Panel]:
         for item in selections
         if item.sport == "Basketball"
         and item.probability > MIN_BASKETBALL_PROBABILITY
-        and item.odds <= 1.32
+        and item.odds <= MAX_ODDS
         and item.strong_consensus
     ]
     used_events: set[str] = set()
@@ -1389,7 +1543,7 @@ def build_daily_panels(
         for item in candidates
         if item.sport == "Basketball"
         and item.probability > MIN_BASKETBALL_PROBABILITY
-        and item.odds <= 1.32
+        and item.odds <= MAX_ODDS
         and item.strong_consensus
     ]
 
@@ -2012,6 +2166,7 @@ def main() -> int:
         statistical_picks = fetch_statistical_picks(
             statistics_key, missing_dates, now
         )
+        analyzed_by_date: dict[date, int] = {}
         for match_date in missing_dates:
             day_count = sum(
                 parse_datetime(str(pick.event["utcDate"])).astimezone(
@@ -2019,13 +2174,48 @@ def main() -> int:
                 ).date() == match_date
                 for pick in statistical_picks
             )
+            analyzed_by_date[match_date] = day_count
             print(
                 f"{match_date.isoformat()} : {day_count} match(s) "
                 "analysé(s) statistiquement."
             )
-        selections_by_date, remaining, odds_requests = verify_statistical_picks(
-            api_key, statistical_picks, missing_dates, now, SPORTS
+        fallback_dates = [
+            match_date
+            for match_date in missing_dates
+            if analyzed_by_date[match_date] == 0
+        ]
+        odds_budget = (
+            MAX_FALLBACK_ODDS_REQUESTS_PER_RUN
+            if fallback_dates
+            else None
         )
+        selections_by_date, remaining, odds_requests = verify_statistical_picks(
+            api_key,
+            statistical_picks,
+            missing_dates,
+            now,
+            SPORTS,
+            max_odds_requests=odds_budget,
+            retry_rate_limit=not fallback_dates,
+        )
+        if fallback_dates:
+            print(
+                "Mode de secours : recherche de matchs dans les compétitions "
+                "complémentaires (événements gratuits ; 3 vérifications de cotes "
+                "payantes maximum)."
+            )
+            fallback_selections, fallback_remaining, fallback_requests = (
+                fetch_fallback_selections(
+                    api_key,
+                    fallback_dates,
+                    now,
+                    max_odds_requests=max(0, odds_budget - odds_requests),
+                )
+            )
+            remaining.extend(fallback_remaining)
+            odds_requests += fallback_requests
+            for match_date, selections in fallback_selections.items():
+                selections_by_date.setdefault(match_date, []).extend(selections)
         for match_date, selections in selections_by_date.items():
             panels_by_date[match_date] = build_daily_panels(
                 selections,

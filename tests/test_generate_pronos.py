@@ -20,6 +20,7 @@ from generate_pronos import (
     event_match_score,
     evaluate_pick,
     fetch_daily_panels,
+    fetch_fallback_selections,
     main,
     merge_sheet_rows,
     panels_to_sheet_rows,
@@ -70,6 +71,29 @@ class ApiRequestTests(unittest.TestCase):
         ) as sleep:
             with self.assertRaisesRegex(RuntimeError, "HTTP 429"):
                 api_get("/sports", {}, "test-key")
+
+        urlopen.assert_called_once()
+        sleep.assert_called_once_with(1.2)
+
+    def test_api_get_can_disable_retries_for_strict_request_limits(self):
+        error = HTTPError(
+            "https://api.the-odds-api.com/v4/sports/event/odds",
+            429,
+            "Too Many Requests",
+            {},
+            BytesIO(b'{"error_code":"EXCEEDED_FREQ_LIMIT"}'),
+        )
+
+        with patch("generate_pronos.urlopen", side_effect=error) as urlopen, patch(
+            "generate_pronos.time.sleep"
+        ) as sleep:
+            with self.assertRaisesRegex(RuntimeError, "HTTP 429"):
+                api_get(
+                    "/sports/event/odds",
+                    {"markets": "h2h"},
+                    "test-key",
+                    retry_rate_limit=False,
+                )
 
         urlopen.assert_called_once()
         sleep.assert_called_once_with(1.2)
@@ -148,22 +172,22 @@ class QuoteTests(unittest.TestCase):
         for bookmaker in event["bookmakers"]:
             for outcome in bookmaker["markets"][0]["outcomes"]:
                 if outcome["name"] == "Home FC":
-                    outcome["price"] = 1.20
+                    outcome["price"] = 1.15
                 elif outcome["name"] == "Away FC":
-                    outcome["price"] = 1.50
+                    outcome["price"] = 1.65
             for outcome in bookmaker["markets"][1]["outcomes"]:
                 if outcome["name"] == "Over" and outcome["point"] == 1.5:
-                    outcome["price"] = 1.20
+                    outcome["price"] = 1.15
                 elif outcome["name"] == "Under" and outcome["point"] == 3.5:
-                    outcome["price"] = 1.50
+                    outcome["price"] = 1.65
 
         candidates = quote_candidates(event, "soccer_epl")
 
         by_pick = {candidate.pick: candidate for candidate in candidates}
-        self.assertEqual(by_pick["Vainqueur 1"].odds, 1.20)
-        self.assertEqual(by_pick["Vainqueur 2"].odds, 1.50)
-        self.assertEqual(by_pick["Total +1,5"].odds, 1.20)
-        self.assertEqual(by_pick["Total -3,5"].odds, 1.50)
+        self.assertEqual(by_pick["Vainqueur 1"].odds, 1.15)
+        self.assertEqual(by_pick["Vainqueur 2"].odds, 1.65)
+        self.assertEqual(by_pick["Total +1,5"].odds, 1.15)
+        self.assertEqual(by_pick["Total -3,5"].odds, 1.65)
 
     def test_selected_quote_checks_only_requested_outcome_and_line(self):
         pick = StatisticalPick(
@@ -185,8 +209,8 @@ class QuoteTests(unittest.TestCase):
                             "key": "alternate_totals",
                             "outcomes": [
                                 {"name": "Under", "point": 2.5, "price": 1.25},
-                                {"name": "Under", "point": 3.5, "price": 1.20},
-                                {"name": "Over", "point": 3.5, "price": 1.50},
+                                {"name": "Under", "point": 3.5, "price": 1.15},
+                                {"name": "Over", "point": 3.5, "price": 1.65},
                             ],
                         }
                     ]
@@ -194,7 +218,7 @@ class QuoteTests(unittest.TestCase):
             ],
         }
 
-        self.assertEqual(selected_market_quote(event, pick), (1.20, 1))
+        self.assertEqual(selected_market_quote(event, pick), (1.15, 1))
 
     def test_selected_quote_derives_double_chance_from_h2h(self):
         pick = StatisticalPick(
@@ -228,8 +252,8 @@ class QuoteTests(unittest.TestCase):
         quote = selected_market_quote(event, pick)
 
         self.assertIsNotNone(quote)
-        self.assertGreaterEqual(quote[0], 1.20)
-        self.assertLessEqual(quote[0], 1.50)
+        self.assertGreaterEqual(quote[0], 1.15)
+        self.assertLessEqual(quote[0], 1.65)
         self.assertEqual(quote[1], 1)
 
 
@@ -364,7 +388,7 @@ class StatisticalAnalysisTests(unittest.TestCase):
             for index in range(6)
         ]
 
-        def fake_api_get(path, params, api_key):
+        def fake_api_get(path, params, api_key, retry_rate_limit=True):
             if path.endswith("/events"):
                 return events, {}
             event_id = path.rsplit("/", 2)[-2]
@@ -404,6 +428,96 @@ class StatisticalAnalysisTests(unittest.TestCase):
         self.assertTrue(
             all(call.args[1]["markets"] == "h2h" for call in odds_calls)
         )
+
+
+class FallbackTests(unittest.TestCase):
+    def test_fallback_caps_paid_requests_and_checks_one_market_per_event(self):
+        days = [date(2026, 11, 26), date(2026, 11, 27)]
+        now = datetime(2026, 11, 26, 8, tzinfo=timezone.utc)
+        sports = {
+            "soccer_uefa_europa_league": ("Football", "Ligue Europa"),
+            "soccer_uefa_europa_conference_league": (
+                "Football", "Ligue Conférence"
+            ),
+            "basketball_nba": ("Basketball", "NBA"),
+        }
+        events = [
+            {
+                "id": f"fallback-{index}",
+                "home_team": f"Home {index}",
+                "away_team": f"Away {index}",
+                "commence_time": (
+                    f"2026-11-{26 if index < 2 else 27}T17:00:00Z"
+                ),
+            }
+            for index in range(5)
+        ]
+        def fake_api_get(path, params, api_key, retry_rate_limit=True):
+            if path.endswith("/events"):
+                return events, {}
+            event = next(
+                item for item in events if item["id"] in path
+            )
+            quote_event = event_fixture()
+            quote_event.update(event)
+            for bookmaker in quote_event["bookmakers"]:
+                for market in bookmaker["markets"]:
+                    for outcome in market["outcomes"]:
+                        if outcome["name"] == "Home FC":
+                            outcome["name"] = event["home_team"]
+                        elif outcome["name"] == "Away FC":
+                            outcome["name"] = event["away_team"]
+                        outcome["price"] = 1.65
+            return quote_event, {"x-requests-remaining": "10"}
+
+        with patch("generate_pronos.active_sports", return_value=sports), patch(
+            "generate_pronos.api_get", side_effect=fake_api_get
+        ) as api_get:
+            selections, remaining, request_count = fetch_fallback_selections(
+                "odds-key", days, now, max_odds_requests=10
+            )
+
+        odds_calls = [
+            item for item in api_get.call_args_list
+            if "/odds" in item.args[0]
+        ]
+        self.assertEqual(request_count, 3)
+        self.assertEqual(len(odds_calls), 3)
+        self.assertTrue(
+            all(item.args[1]["markets"] == "h2h" for item in odds_calls)
+        )
+        self.assertEqual(sum(map(len, selections.values())), 3)
+        self.assertEqual(set(selections), set(days))
+        self.assertTrue(
+            all(item.odds == 1.65 for day in selections.values() for item in day)
+        )
+        self.assertEqual(remaining, ["10", "10", "10"])
+
+    def test_main_triggers_fallback_when_a_day_has_no_statistical_matches(self):
+        output = StringIO()
+        with patch.dict(
+            "os.environ",
+            {
+                "FOOTBALL_DATA_API_KEY": "statistics-key",
+                "ODDS_API_KEY": "odds-key",
+            },
+        ), patch("sys.argv", ["generate_pronos.py", "--dry-run"]), patch(
+            "generate_pronos.fetch_statistical_picks", return_value=[]
+        ), patch(
+            "generate_pronos.verify_statistical_picks",
+            return_value=({}, [], 0),
+        ) as verify, patch(
+            "generate_pronos.fetch_fallback_selections",
+            return_value=({}, [], 0),
+        ) as fallback, redirect_stdout(output):
+            result = main()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(len(fallback.call_args.args[1]), 2)
+        self.assertEqual(verify.call_args.kwargs["max_odds_requests"], 3)
+        self.assertFalse(verify.call_args.kwargs["retry_rate_limit"])
+        self.assertEqual(fallback.call_args.kwargs["max_odds_requests"], 3)
+        self.assertIn("Mode de secours", output.getvalue())
 
 
 class ResultTests(unittest.TestCase):
@@ -510,7 +624,7 @@ class PanelTests(unittest.TestCase):
         football = [selection(f"f-{i}", probability=0.8 - i * 0.01) for i in range(12)]
         basketball = [
             selection("b-weak", sport="Basketball", probability=0.70, odds=1.40),
-            selection("b-expensive", sport="Basketball", probability=0.80, odds=1.40),
+            selection("b-expensive", sport="Basketball", probability=0.80, odds=1.65),
             selection("b-strong", sport="Basketball", probability=0.76, odds=1.30),
         ]
         panels = build_panels(football + basketball)
@@ -519,7 +633,7 @@ class PanelTests(unittest.TestCase):
         self.assertEqual(len(all_selections), 12)
         self.assertEqual(len({item.event_id for item in all_selections}), 12)
         self.assertNotIn("b-weak", {item.event_id for item in all_selections})
-        self.assertNotIn("b-expensive", {item.event_id for item in all_selections})
+        self.assertIn("b-expensive", {item.event_id for item in all_selections})
         self.assertIn("b-strong", {item.event_id for item in all_selections})
         self.assertTrue(all(len(panel.selections) == 4 for panel in panels))
 
