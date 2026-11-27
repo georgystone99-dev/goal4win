@@ -955,7 +955,12 @@ def selections_from_events(
 def _team_match_score(first: str, second: str) -> float:
     def cleaned(value: str) -> str:
         words = re.sub(r"[^a-z0-9]+", " ", normalized(value)).split()
-        while words and words[-1] in {"fc", "cf", "sc", "afc", "club"}:
+        club_markers = {
+            "fc", "cf", "ac", "as", "sc", "afc", "club", "1909", "1899", "04"
+        }
+        while words and words[0] in club_markers:
+            words.pop(0)
+        while words and words[-1] in club_markers:
             words.pop()
         return " ".join(words)
 
@@ -2179,14 +2184,12 @@ def main() -> int:
                 f"{match_date.isoformat()} : {day_count} match(s) "
                 "analysé(s) statistiquement."
             )
-        fallback_dates = [
-            match_date
-            for match_date in missing_dates
-            if analyzed_by_date[match_date] == 0
-        ]
+        fallback_may_be_needed = (
+            today in missing_dates and analyzed_by_date.get(today, 0) == 0
+        )
         odds_budget = (
             MAX_FALLBACK_ODDS_REQUESTS_PER_RUN
-            if fallback_dates
+            if fallback_may_be_needed
             else None
         )
         selections_by_date, remaining, odds_requests = verify_statistical_picks(
@@ -2196,7 +2199,12 @@ def main() -> int:
             now,
             SPORTS,
             max_odds_requests=odds_budget,
-            retry_rate_limit=not fallback_dates,
+            retry_rate_limit=not fallback_may_be_needed,
+        )
+        fallback_dates = (
+            [today]
+            if today in missing_dates and not selections_by_date.get(today)
+            else []
         )
         if fallback_dates:
             print(

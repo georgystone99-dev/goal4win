@@ -11,6 +11,7 @@ from generate_pronos import (
     Selection,
     StatisticalPick,
     SHEET_HEADERS,
+    TIMEZONE,
     api_get,
     active_sports,
     analyze_match,
@@ -21,6 +22,7 @@ from generate_pronos import (
     evaluate_pick,
     fetch_daily_panels,
     fetch_fallback_selections,
+    football_data_get,
     main,
     merge_sheet_rows,
     panels_to_sheet_rows,
@@ -360,6 +362,54 @@ class StatisticalAnalysisTests(unittest.TestCase):
 
         self.assertIsNotNone(score)
 
+    def test_soft_event_matching_removes_common_club_name_markers(self):
+        examples = [
+            ("Venezia FC", "Venezia"),
+            ("Bologna FC 1909", "Bologna"),
+            ("AC Milan", "Milan"),
+            ("1899 Hoffenheim", "Hoffenheim"),
+            ("AS Roma", "Roma"),
+            ("Sporting SC", "Sporting"),
+        ]
+        for football_data_name, odds_name in examples:
+            with self.subTest(football_data_name=football_data_name):
+                pick = StatisticalPick(
+                    event={
+                        "utcDate": "2026-11-26T17:00:00Z",
+                        "homeTeam": {"name": football_data_name},
+                        "awayTeam": {"name": football_data_name},
+                    },
+                    sport_key="soccer_italy_serie_a",
+                    pick="Vainqueur 1",
+                    market="h2h",
+                    outcome="home",
+                    point=None,
+                    confidence=0.8,
+                )
+                score = event_match_score(
+                    pick,
+                    {
+                        "home_team": odds_name,
+                        "away_team": odds_name,
+                        "commence_time": "2026-11-26T17:00:00Z",
+                    },
+                )
+
+                self.assertIsNotNone(score)
+
+    def test_football_data_requests_wait_at_least_six_seconds(self):
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b"{}"
+        with patch("generate_pronos._FOOTBALL_DATA_LAST_REQUEST_AT", None), patch(
+            "generate_pronos.time.monotonic", side_effect=[10.0, 11.0, 11.0]
+        ), patch("generate_pronos.time.sleep") as sleep, patch(
+            "generate_pronos.urlopen", return_value=response
+        ):
+            football_data_get("/test", {}, "test-key")
+            football_data_get("/test", {}, "test-key")
+
+        sleep.assert_called_once_with(5.1)
+
     def test_verifies_only_the_five_top_matches_with_one_market_each(self):
         day = date(2026, 11, 26)
         picks = [
@@ -513,11 +563,34 @@ class FallbackTests(unittest.TestCase):
             result = main()
 
         self.assertEqual(result, 0)
-        self.assertEqual(len(fallback.call_args.args[1]), 2)
+        self.assertEqual(fallback.call_args.args[1], verify.call_args.args[2][:1])
         self.assertEqual(verify.call_args.kwargs["max_odds_requests"], 3)
         self.assertFalse(verify.call_args.kwargs["retry_rate_limit"])
         self.assertEqual(fallback.call_args.kwargs["max_odds_requests"], 3)
         self.assertIn("Mode de secours", output.getvalue())
+
+    def test_main_skips_fallback_when_pronostics_exist_today(self):
+        output = StringIO()
+        today = datetime.now(timezone.utc).astimezone(TIMEZONE).date()
+        selections = {today: [selection("today")]}
+        with patch.dict(
+            "os.environ",
+            {
+                "FOOTBALL_DATA_API_KEY": "statistics-key",
+                "ODDS_API_KEY": "odds-key",
+            },
+        ), patch("sys.argv", ["generate_pronos.py", "--dry-run"]), patch(
+            "generate_pronos.fetch_statistical_picks", return_value=[]
+        ), patch(
+            "generate_pronos.verify_statistical_picks",
+            return_value=(selections, [], 1),
+        ), patch(
+            "generate_pronos.fetch_fallback_selections"
+        ) as fallback, redirect_stdout(output):
+            result = main()
+
+        self.assertEqual(result, 0)
+        fallback.assert_not_called()
 
 
 class ResultTests(unittest.TestCase):
